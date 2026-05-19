@@ -1,0 +1,39 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: scrum_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  dashboard:
+    build: ./dashboard
+    container_name: scrum_dashboard
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8888}:8888"
+    env_file:
+      - .env
+    volumes:
+      - scrum_data:/data
+    networks:
+      - internal
+    depends_on:
+      redis:
+        condition: service_healthy
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  redis_data:
+  scrum_data:
