@@ -1,55 +1,52 @@
-# Scrum 🏉
+<p align="center">
+  <img src="assets/wordmark.png" alt="Scrum" width="240">
+</p>
 
-**A self-hosted rugby companion app with a prediction league built in.**
+<p align="center">
+  A self-hosted rugby companion app with a prediction league built in.<br>
+  Live fixtures, match results, standings and squad data across 10 competitions —<br>
+  plus a full prediction game to play with your mates.
+</p>
 
-Scrum is genuinely useful as a standalone rugby dashboard — live fixtures, match results with full breakdowns, league standings, squad data, and news across 10 major competitions. No account required to browse. The prediction game is the social layer that makes it worth sharing with your mates.
-
-> Built for the guy with an old laptop and a group of rugby-mad friends. If it runs on that, it runs anywhere.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#how-auto-resolution-works">Auto-Resolution</a> · <a href="#configuration">Configuration</a>
+</p>
 
 ---
 
-## What you get
+![Results](screenshots/results.png)
 
-### As a rugby fan
-- Fixtures across 10 competitions (Super Rugby Pacific, URC, Six Nations, Rugby Championship, Premiership, Top 14, Champions Cup, Challenge Cup, World Cup, International)
-- Match results with full breakdowns — try scorers grouped by team with minute stamps, first try scorer, Man of the Match
-- League standings
-- Pre-match squad data (updated 48–72h before kickoff)
+---
+
+## Features
+
+### As a rugby companion
+- Fixtures across 10 competitions — Super Rugby Pacific, URC, Six Nations, Rugby Championship, Premiership, Top 14, Champions Cup, Challenge Cup, World Cup, International
+- Full match breakdowns — try scorers grouped by team with minute stamps, first try scorer, Man of the Match
+- League standings updated from ESPN
+- Pre-match squad data updated 48–72h before kickoff
 - Rugby news feed
 
 ### As a prediction league
-- Predict on 7 types per match: score, winner, margin band, both teams scored, anytime try scorer, first try scorer, Man of the Match
-- Banker pick — double your points once per week
-- Private groups with custom league subscriptions and prediction types
-- Auto-resolution via ESPN (scores, try scorers, margin) + RSS scraping (MOTM)
-- Full match breakdown showing correct answers after the whistle
-- Group leaderboards, personal stats, head-to-head, hot streaks
+- 7 prediction types: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer, Man of the Match
+- Banker pick — mark one prediction per week to double your points
+- Private groups with custom league subscriptions and prediction type sets
+- Full auto-resolution via ESPN + RSS scraping — no manual data entry for most matches
+- Group leaderboards, personal accuracy stats, head-to-head, hot streak, shareable profile cards
 
-### As an admin
-- Fully managed via in-app admin panel
-- No server access needed after initial setup
-- Magic link password resets (no email server required)
-- Manual MOTM entry fallback for when auto-scrape doesn't find it
+### Self-hosted friendly
+- One `docker compose up --build -d` and it's running
+- No email server — password resets via admin-generated magic links (share on WhatsApp)
+- No API keys — uses ESPN (free) and public RSS feeds
+- All data stays on your server
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- Docker + Docker Compose
-- ~200MB RAM, ~500MB disk
-- A port (default: 8888)
-
-### 1. Clone
-
 ```bash
-git clone https://github.com/Johannes1202/scrum.git
-cd scrum
-```
-
-### 2. Configure
-
-```bash
+git clone https://github.com/Johannes1202/Scrum.git
+cd Scrum
 cp .env.example .env
 ```
 
@@ -57,76 +54,56 @@ Edit `.env`:
 
 ```env
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=your_secure_password
-SESSION_SECRET=replace_with_64_char_hex   # openssl rand -hex 32
-REDIS_URL=redis://redis:6379
-DB_PATH=/data/scrum.db
-PORT=8888
+ADMIN_PASSWORD=changeme
+SESSION_SECRET=<run: openssl rand -hex 32>
 ```
-
-### 3. Run
 
 ```bash
 docker compose up --build -d
 ```
 
-That's it. Open `http://localhost:8888` and log in with your admin credentials.
+Open `http://localhost:8888`. Log in, create a group, invite your mates.
 
-> ⚠️ **Important:** Always use `docker compose up --build -d` when updating. `docker compose restart` uses the old image and won't pick up code changes.
-
----
-
-## First run checklist
-
-1. **Log in** as admin
-2. **Go to Admin panel** — create accounts for your players (or share the signup link)
-3. **Create a Group** — choose which leagues to follow and which prediction types to enable
-4. **Invite your players** — generate an invite link from the group page, share it on WhatsApp
-5. **Wait for a match** — results auto-resolve within an hour of final whistle
+> **Always use `docker compose up --build -d` when updating** — `docker compose restart` uses the old image.
 
 ---
 
-## How predictions work
+## Screenshots
 
-Each match has a 48-hour prediction window that opens before kickoff. Players predict on any combination of:
+| | |
+|---|---|
+| ![Groups](screenshots/groups.png) | ![Predict](screenshots/predict.png) |
+| **Groups** — per-league collapsible sections with fixtures, standings, awaiting and recent results | **Predict** — upcoming fixtures across competitions with prediction status |
 
-| Type | Points | How it resolves |
-|------|--------|-----------------|
-| Score Prediction | 5 exact / 3 closest in group / 1 otherwise | Auto (ESPN) |
-| Winner | 2 | Auto (ESPN) |
-| Winning Margin Band | 2 | Auto (ESPN) |
-| Both Teams Scored | 1 | Auto (ESPN) |
-| Anytime Try Scorer | 3 | Auto (ESPN) |
-| First Try Scorer | 4 | Auto (ESPN) |
-| Man of the Match | 3 | Auto (RSS scraper) + admin fallback |
-
-**Banker pick:** Mark one prediction per week as your banker — correct picks earn double points.
+| | |
+|---|---|
+| ![Me](screenshots/me.png) | ![News](screenshots/news.png) |
+| **Me** — personal stats, prediction accuracy by type, hot streak, upcoming fixtures | **News** — live rugby news feed |
 
 ---
 
-## Auto-resolution pipeline
+## How auto-resolution works
 
-Scrum runs a background process every 60 minutes that:
+After the final whistle, Scrum:
 
-1. **Checks ESPN** for completed matches and applies scores
-2. **Fetches try scorer data** from ESPN match summaries (with retry logic for slow data)
-3. **Scrapes MOTM** from 4 public RSS feeds (RugbyPass, BBC, The Roar, ESPN) using article pattern matching
-4. **Scores all groups** with the full result data
+1. **Fetches the result from ESPN** and scores all groups immediately
+2. **Pulls try scorer data** from ESPN match summaries — each try has the scorer's name, team, and minute
+3. **Scrapes Man of the Match** from 4 public RSS feeds (RugbyPass, BBC Sport, The Roar, ESPN) using article pattern matching and player ratings extraction
 
-MOTM scraping retries hourly for 48 hours. If it still can't find it after that, the admin can enter it manually in the admin panel — one field, one button.
+MOTM retries hourly for 48 hours. If it still can't find it, the admin enters it manually from the admin panel — one field, one button.
 
 ---
 
-## Configuration reference
+## Configuration
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ADMIN_USERNAME` | Yes | — | Admin account username |
-| `ADMIN_PASSWORD` | Yes | — | Admin account password |
-| `SESSION_SECRET` | Yes | — | 64-char hex string for session signing |
-| `REDIS_URL` | No | `redis://redis:6379` | Redis connection URL |
-| `DB_PATH` | No | `/data/scrum.db` | SQLite database path |
-| `PORT` | No | `8888` | Port to expose |
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_USERNAME` | — | Admin account username |
+| `ADMIN_PASSWORD` | — | Admin account password |
+| `SESSION_SECRET` | — | Random hex string — `openssl rand -hex 32` |
+| `REDIS_URL` | `redis://redis:6379` | Redis connection (leave as-is with docker-compose) |
+| `DB_PATH` | `/data/scrum.db` | SQLite database path |
+| `PORT` | `8888` | Port to expose |
 
 ---
 
@@ -137,84 +114,37 @@ git pull
 docker compose up --build -d
 ```
 
-The app runs database migrations automatically on startup — no manual schema changes needed.
+Database migrations run automatically on startup.
 
 ---
 
 ## Exposing publicly
 
-Scrum works great behind a reverse proxy or Cloudflare Tunnel.
-
-### Nginx example
+Works great behind Nginx or Cloudflare Tunnel.
 
 ```nginx
-server {
-    listen 80;
-    server_name scrum.yourdomain.com;
-    location / {
-        proxy_pass http://localhost:8888;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
+location / {
+    proxy_pass http://localhost:8888;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
 }
 ```
 
-### Cloudflare Tunnel
-
-```bash
-cloudflared tunnel --url http://localhost:8888
-```
-
 ---
 
-## Competitions covered
+## Competitions
 
-| Competition | Leagues |
-|-------------|---------|
-| Super Rugby Pacific | Australia, New Zealand, Pacific Islands |
-| United Rugby Championship | Ireland, Scotland, Wales, South Africa, Italy |
-| Six Nations | England, France, Ireland, Scotland, Wales, Italy |
-| Rugby Championship | South Africa, New Zealand, Australia, Argentina |
-| Premiership Rugby | England |
-| Top 14 | France |
-| Champions Cup | Europe |
-| Challenge Cup | Europe |
-| Rugby World Cup | International |
-| International Rugby | Test matches |
+Super Rugby Pacific · URC · Six Nations · Rugby Championship · Premiership · Top 14 · Champions Cup · Challenge Cup · Rugby World Cup · International
 
-Fixtures, results, standings and squad data are pulled automatically from ESPN. No API keys required.
-
----
-
-## Data & Privacy
-
-- All data stays on your server. Nothing is sent anywhere except outbound requests to ESPN (results/fixtures) and public RSS feeds (MOTM news)
-- No email server required — password resets use admin-generated magic links
-- No analytics, no tracking, no third-party scripts
+Fixtures, results, standings and squad data pulled from ESPN. No API key required.
 
 ---
 
 ## Tech stack
 
-- **Backend:** Python 3.12 / FastAPI
-- **Database:** SQLite (via aiosqlite)
-- **Cache:** Redis 7
-- **Container:** Docker + Docker Compose
-- **Data sources:** ESPN API (free, no key) + RugbyPass/BBC/The Roar RSS feeds (free, no key)
-- **Frontend:** Server-rendered HTML, vanilla JS, no framework
+Python 3.12 / FastAPI · SQLite · Redis · Docker Compose · Vanilla JS · No framework · No build step
 
-Single binary deployment. One `docker compose up` and it's running.
-
----
-
-## Architecture notes
-
-- Single-file FastAPI app — all routes, HTML rendering, background tasks in `server.py`
-- All HTML rendered server-side as f-strings — no template engine, no build step
-- Predictions are global per user per match — groups are just scoring lenses on the same prediction data
-- Global group (id=1) is a system group — not shown in UI, powers the global Predictions page
-- Custom competitions let group admins create mini-tournaments from any mix of matches
+Single-file backend. One compose file. Runs on anything with Docker.
 
 ---
 
@@ -224,4 +154,4 @@ MIT — do whatever you want with it.
 
 ---
 
-*Built with too much coffee and a deep love of rugby. Tested against live Super Rugby, URC, Six Nations, and Champions Cup data.*
+*Built for the guy with an old laptop and a group of rugby-mad friends.*
