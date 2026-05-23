@@ -2022,11 +2022,22 @@ async def me_page(request: Request):
                 m["slug"] = m_slug
                 next_upcoming = m
         # Missed = matches where window opened + closed and user didn't predict
+        # Only count missed predictions from after the user joined their first group
+        # (prevents legacy-imported predictions from counting as missed)
+        async with _db.execute(
+            "SELECT MIN(joined_at) FROM group_members WHERE username=? AND group_id != 1",
+            (username,),
+        ) as cur:
+            row = await cur.fetchone()
+            joined_since = row[0] if (row and row[0]) else now_ts
         async with _db.execute(
             """SELECT COUNT(DISTINCT p2.match_id) as n FROM predictions p2
+               JOIN group_members gm ON gm.username=p2.username AND gm.group_id IN (
+                   SELECT group_id FROM group_members WHERE username=? AND group_id != 1
+               )
                LEFT JOIN predictions my ON my.match_id=p2.match_id AND my.username=?
-               WHERE my.match_id IS NULL AND p2.kickoff_ts > 0 AND p2.kickoff_ts < ?""",
-            (username, now_ts - 172800),
+               WHERE my.match_id IS NULL AND p2.kickoff_ts > ? AND p2.kickoff_ts < ?""",
+            (username, username, joined_since, now_ts - 172800),
         ) as cur:
             row = await cur.fetchone()
             missed_count = row["n"] if row else 0
