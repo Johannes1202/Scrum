@@ -1539,7 +1539,7 @@ def _bnav(active: str = "", invite_count: int = 0, is_admin: bool = False) -> st
   <a href="/groups" class="bnav-item{_ac('groups')}">{_icon("nav-shields.png","Groups")}</a>
   <a href="/leaderboard" class="bnav-item{_ac('leaderboard')}">{_icon("nav-ball.png","Predict")}</a>
   <a href="/history" class="bnav-item{_ac('history')}">
-    <span class="material-symbols-outlined" style="font-size:1.35rem;color:inherit">scoreboard</span>
+    <span class="material-symbols-outlined" style="font-size:1.35rem">scoreboard</span>
     <span>Results</span>
   </a>
   <button class="bnav-item{more_active}" onclick="document.getElementById('more-sheet').classList.toggle('open')" style="background:none;border:none;cursor:pointer">
