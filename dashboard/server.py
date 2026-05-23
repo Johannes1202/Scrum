@@ -2194,7 +2194,7 @@ async def me_page(request: Request):
   function clear(){{ target.value=''; btn.disabled=true; btn.style.opacity='.4'; }}
   function showDrop(hits){{
     const r=input.getBoundingClientRect();
-    drop.style.top=(r.bottom+window.scrollY)+'px';
+    drop.style.top=r.bottom+'px';
     drop.style.left=r.left+'px';
     drop.style.width=r.width+'px';
     drop.innerHTML=hits.map(u=>`<div class="fac-item" data-v="${{u.v}}" data-l="${{u.l}}">${{u.l}}</div>`).join('');
@@ -2840,9 +2840,6 @@ async def groups_page(request: Request):
     is_admin = user and user["is_admin"]
     my_groups = await _get_user_groups(username)
 
-    # Single group → skip the list, go straight in
-    if len(my_groups) == 1:
-        return RedirectResponse(url=f"/groups/{my_groups[0]['slug']}", status_code=302)
     pending_invites = await _pending_invite_count(username)
 
     cards = ""
