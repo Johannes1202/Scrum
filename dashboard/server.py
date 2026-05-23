@@ -6776,8 +6776,9 @@ async def upload_avatar(request: Request, file: UploadFile = File(...)):
     if not (data[:2] == b'\xff\xd8' or data[:8] == b'\x89PNG\r\n\x1a\n'):
         return Response(status_code=415)
     try:
-        from PIL import Image
+        from PIL import Image, ImageFile
         import io
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
         img = Image.open(io.BytesIO(data)).convert("RGB")
         # Square crop from center
         w, h = img.size
