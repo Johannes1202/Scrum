@@ -5489,17 +5489,23 @@ async def how_to_play(request: Request):
       </tr>
     </table>
     <p>Score points use a diff system — <span class="badge-exact">Exact</span> score = 5 pts, <span class="badge-closest">Closest</span> diff in your group = 3 pts, everyone else who predicted = 1 pt. All other types are right or wrong.</p>
-    <p>Maximum possible per match (all types enabled): <strong>20 pts</strong>.</p>
+    <p>Maximum possible per match (all types enabled): <strong>20 pts</strong>. With a banker it doubles to <strong>40 pts</strong>.</p>
+  </div>
+
+  <div class="htp-section">
+    <h2>Banker Pick</h2>
+    <p>Once per week you can mark one prediction as your <strong>Banker</strong>. If you earn any points on that match, they're doubled. If you score zero, nothing happens — no penalty.</p>
+    <p>The banker toggle appears at the bottom of the prediction form. You can only have one banker active per week — marking a new one automatically clears the previous week's banker if it's still in the same 7-day window.</p>
   </div>
 
   <div class="htp-section">
     <h2>Example</h2>
     <div class="htp-example">
-      <div class="ex-label">All Blacks 32 – 18 Argentina · Ardie Savea scores first try · MOTM: Sam Cane</div>
+      <div class="ex-label">All Blacks 35 – 17 Argentina · Ardie Savea scores first try · MOTM: Sam Cane</div>
       <table>
-        <tr><td>Score: predicted <strong>32 – 18</strong></td><td>5 pts <span class="badge-exact">Exact</span></td></tr>
+        <tr><td>Score: predicted <strong>35 – 17</strong></td><td>5 pts <span class="badge-exact">Exact</span></td></tr>
         <tr><td>Winner: predicted <strong>Home</strong> ✓</td><td>+2 pts</td></tr>
-        <tr><td>Margin: predicted <strong>15–21</strong> ✓ (diff was 14)</td><td>+2 pts</td></tr>
+        <tr><td>Margin: predicted <strong>15–21</strong> ✓ (diff was 18)</td><td>+2 pts</td></tr>
         <tr><td>Both teams score: predicted <strong>Yes</strong> ✓</td><td>+1 pt</td></tr>
         <tr><td>Anytime try scorer: picked <strong>Savea</strong> ✓</td><td>+3 pts</td></tr>
         <tr><td>First try scorer: picked <strong>Retallick</strong> ✗</td><td>0 pts</td></tr>
@@ -5525,6 +5531,7 @@ async def how_to_play(request: Request):
     <h2>Groups</h2>
     <p>Groups are private leagues. Each group has its own fixture feed (filtered to the competitions it follows) and its own leaderboard. You can be in multiple groups at once — your prediction is made once but scores separately in each group based on that group's rules.</p>
     <p>Pending group invites appear on your Me page. Tap <strong>Accept</strong> to join or <strong>Decline</strong> to pass.</p>
+    <p><strong>Custom Competitions:</strong> Group admins can create mini-tournaments — pick any matches from the feed and give the competition a name (e.g. "NZ Tour of SA"). Custom competitions get their own leaderboard card within the group, separate from the main standings.</p>
   </div>
 
   <div class="htp-section">
