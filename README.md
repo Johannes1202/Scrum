@@ -16,6 +16,8 @@
 
 ![Results](screenshots/results.png)
 
+![Demo](screenshots/demo.gif)
+
 ---
 
 ## Features
