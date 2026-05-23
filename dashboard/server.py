@@ -3086,8 +3086,6 @@ async def group_home(request: Request, slug: str):
             in_custom = m_slug in custom_match_ids
             if not in_league and not in_custom:
                 continue
-            if kts and kts > now_ts + 14 * 86400 and not in_custom:
-                continue
             m["_custom"] = in_custom and not in_league
             seen_ids.add(m_slug)
             espn_upcoming.append(m)
