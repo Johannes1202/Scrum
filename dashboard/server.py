@@ -3348,12 +3348,10 @@ async def group_home(request: Request, slug: str):
         for cm in cc_matches_all:
             if cm["kickoff_ts"] <= now_ts:
                 continue
-            if cm["match_id"] not in shown_slugs:
-                shown_slugs.add(cm["match_id"])
-                found = next((m for m in espn_upcoming if m.get("slug") == cm["match_id"]), None)
-                cc_fix_matches.append(found or {"team_home": cm["team_home"], "team_away": cm["team_away"],
-                    "kickoff_ts": cm["kickoff_ts"], "tournament": cm["tournament"],
-                    "slug": cm["match_id"], "in_progress": False})
+            found = next((m for m in espn_upcoming if m.get("slug") == cm["match_id"]), None)
+            cc_fix_matches.append(found or {"team_home": cm["team_home"], "team_away": cm["team_away"],
+                "kickoff_ts": cm["kickoff_ts"], "tournament": cm["tournament"],
+                "slug": cm["match_id"], "in_progress": False})
         cc_fix_html = "".join(_fix_card(m) for m in cc_fix_matches) if cc_fix_matches else '<div class="empty-msg" style="padding:.75rem">No upcoming fixtures.</div>'
         cc_upcoming = f'<div class="page-section"><div class="section-banner sub collapsible" onclick="toggleSection(this)">Upcoming Fixtures<span class="material-symbols-outlined sb-chevron">expand_more</span></div><div class="collapsible-body"><div class="fix-section">{cc_fix_html}</div></div></div>'
         if cc_match_ids:
