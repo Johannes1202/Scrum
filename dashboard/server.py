@@ -2422,17 +2422,121 @@ async def me_page(request: Request):
 {_nav(username, is_admin, "me")}
 <div class="page-body">
   <div class="me-header">
-    <label class="me-avatar-wrap" title="Change photo" style="cursor:pointer;position:relative;flex-shrink:0">
+    <div class="me-avatar-wrap" title="Change photo" style="cursor:pointer;position:relative;flex-shrink:0" onclick="document.getElementById('av-input').click()">
       {_avatar_el(username, 52)}
       <div style="position:absolute;bottom:0;right:0;background:var(--accent3);border-radius:50%;width:18px;height:18px;display:flex;align-items:center;justify-content:center">
         <span class="material-symbols-outlined" style="font-size:.7rem;color:#fff">photo_camera</span>
       </div>
-      <input type="file" accept="image/*" style="display:none" onchange="
-        const f=this.files[0]; if(!f)return;
-        const fd=new FormData(); fd.append('file',f);
-        fetch('/me/avatar',{{method:'POST',body:fd}}).then(r=>{{if(r.ok)location.reload();}});
-      ">
-    </label>
+    </div>
+    <input id="av-input" type="file" accept="image/*" style="display:none" onchange="avOpenCrop(this.files[0])">
+    <div id="av-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:10000;flex-direction:column;align-items:center;justify-content:center;gap:.9rem">
+      <div style="color:#fff;font-size:.82rem;opacity:.8">Drag to position · Pinch or scroll to zoom</div>
+      <div id="av-vp" style="width:280px;height:280px;border-radius:50%;overflow:hidden;border:3px solid rgba(255,255,255,.8);position:relative;cursor:grab;touch-action:none;flex-shrink:0">
+        <img id="av-img" style="position:absolute;transform-origin:0 0;pointer-events:none;user-select:none">
+      </div>
+      <input id="av-zoom" type="range" min="100" max="400" value="100" style="width:200px;accent-color:#22a84a" oninput="avSetScale(this.value/100)">
+      <div style="display:flex;gap:.75rem">
+        <button onclick="avCancel()" style="background:rgba(255,255,255,.15);border:none;color:#fff;padding:.55rem 1.2rem;border-radius:8px;font-size:.9rem;cursor:pointer">Cancel</button>
+        <button onclick="avSave()" style="background:#22a84a;border:none;color:#fff;padding:.55rem 1.4rem;border-radius:8px;font-size:.9rem;font-weight:700;cursor:pointer">Save</button>
+      </div>
+    </div>
+    <canvas id="av-canvas" style="display:none"></canvas>
+    <script>
+    (function(){{
+      var VP=280, OUT=256;
+      var img=document.getElementById('av-img');
+      var modal=document.getElementById('av-modal');
+      var vp=document.getElementById('av-vp');
+      var zoomSlider=document.getElementById('av-zoom');
+      var natW=0,natH=0,posX=0,posY=0,scale=1,minScale=1;
+      var dragging=false,lastX=0,lastY=0,lastPinch=0;
+
+      function clamp(){{
+        var dw=natW*scale, dh=natH*scale;
+        posX=Math.min(0,Math.max(VP-dw,posX));
+        posY=Math.min(0,Math.max(VP-dh,posY));
+      }}
+      function render(){{
+        img.style.left=posX+'px';
+        img.style.top=posY+'px';
+        img.style.width=(natW*scale)+'px';
+        img.style.height=(natH*scale)+'px';
+      }}
+      window.avSetScale=function(s){{
+        s=Math.max(minScale,Math.min(4,s));
+        var cx=VP/2, cy=VP/2;
+        var rx=(cx-posX)/(natW*scale), ry=(cy-posY)/(natH*scale);
+        scale=s;
+        posX=cx-rx*natW*scale;
+        posY=cy-ry*natH*scale;
+        clamp(); render();
+        zoomSlider.value=Math.round(s*100);
+      }};
+      window.avOpenCrop=function(file){{
+        if(!file)return;
+        var url=URL.createObjectURL(file);
+        img.onload=function(){{
+          natW=img.naturalWidth; natH=img.naturalHeight;
+          minScale=Math.max(VP/natW,VP/natH);
+          scale=minScale;
+          posX=(VP-natW*scale)/2; posY=(VP-natH*scale)/2;
+          clamp(); render();
+          zoomSlider.min=Math.round(minScale*100);
+          zoomSlider.value=Math.round(scale*100);
+          modal.style.display='flex';
+        }};
+        img.src=url;
+      }};
+      window.avCancel=function(){{
+        modal.style.display='none';
+        document.getElementById('av-input').value='';
+      }};
+      window.avSave=function(){{
+        var c=document.getElementById('av-canvas');
+        c.width=OUT; c.height=OUT;
+        var ctx=c.getContext('2d');
+        var srcX=(-posX)/scale, srcY=(-posY)/scale, srcS=VP/scale;
+        ctx.drawImage(img,srcX,srcY,srcS,srcS,0,0,OUT,OUT);
+        c.toBlob(function(blob){{
+          var fd=new FormData(); fd.append('file',blob,'avatar.jpg');
+          fetch('/me/avatar',{{method:'POST',body:fd}}).then(function(r){{
+            if(r.ok)location.reload(); else alert('Upload failed, try a different photo.');
+          }});
+        }},'image/jpeg',0.88);
+        modal.style.display='none';
+      }};
+      vp.addEventListener('mousedown',function(e){{dragging=true;lastX=e.clientX;lastY=e.clientY;vp.style.cursor='grabbing';}});
+      window.addEventListener('mouseup',function(){{dragging=false;vp.style.cursor='grab';}});
+      window.addEventListener('mousemove',function(e){{
+        if(!dragging)return;
+        posX+=e.clientX-lastX; posY+=e.clientY-lastY;
+        lastX=e.clientX; lastY=e.clientY;
+        clamp(); render();
+      }});
+      vp.addEventListener('wheel',function(e){{
+        e.preventDefault();
+        avSetScale(scale*(e.deltaY<0?1.1:0.9));
+      }},{{passive:false}});
+      vp.addEventListener('touchstart',function(e){{
+        if(e.touches.length===1){{dragging=true;lastX=e.touches[0].clientX;lastY=e.touches[0].clientY;}}
+        else if(e.touches.length===2){{dragging=false;lastPinch=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);}}
+        e.preventDefault();
+      }},{{passive:false}});
+      vp.addEventListener('touchmove',function(e){{
+        if(e.touches.length===1&&dragging){{
+          posX+=e.touches[0].clientX-lastX; posY+=e.touches[0].clientY-lastY;
+          lastX=e.touches[0].clientX; lastY=e.touches[0].clientY;
+          clamp(); render();
+        }} else if(e.touches.length===2){{
+          var d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+          if(lastPinch)avSetScale(scale*d/lastPinch);
+          lastPinch=d;
+        }}
+        e.preventDefault();
+      }},{{passive:false}});
+      vp.addEventListener('touchend',function(){{dragging=false;lastPinch=0;}});
+    }})();
+    </script>
     <div style="flex:1">
       <div class="me-name">{_esc(_ucfirst(username))}</div>
       <div class="me-sub">{'Site Admin · ' if is_admin else ''}Member since {datetime.fromtimestamp(user["created_at"]).strftime("%b %Y") if user else ""}</div>
@@ -6769,26 +6873,23 @@ async def upload_avatar(request: Request, file: UploadFile = File(...)):
     username = _get_session_user(request)
     if not username:
         return Response(status_code=401)
-    data = await file.read(2 * 1024 * 1024)  # 2MB max
+    data = await file.read(4 * 1024 * 1024)  # 4MB max
     if len(data) == 0:
         return Response(status_code=400)
-    # Basic JPEG/PNG check
-    if not (data[:2] == b'\xff\xd8' or data[:8] == b'\x89PNG\r\n\x1a\n'):
-        return Response(status_code=415)
     try:
         from PIL import Image, ImageFile
         import io
         ImageFile.LOAD_TRUNCATED_IMAGES = True
         img = Image.open(io.BytesIO(data)).convert("RGB")
-        # Square crop from center
-        w, h = img.size
-        side = min(w, h)
-        left = (w - side) // 2
-        top = (h - side) // 2
-        img = img.crop((left, top, left + side, top + side))
-        img = img.resize((256, 256), Image.LANCZOS)
+        # Resize to 256x256 if not already (canvas sends exact size, originals may vary)
+        if img.size != (256, 256):
+            side = min(img.size)
+            w, h = img.size
+            img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+            img = img.resize((256, 256), Image.LANCZOS)
         out = io.BytesIO()
-        img.save(out, "JPEG", quality=85)
+        img.save(out, "JPEG", quality=88)
+        os.makedirs(AVATAR_DIR, exist_ok=True)
         with open(os.path.join(AVATAR_DIR, f"{username}.jpg"), "wb") as f:
             f.write(out.getvalue())
     except Exception as exc:
