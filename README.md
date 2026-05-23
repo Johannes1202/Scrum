@@ -14,9 +14,9 @@
 
 ---
 
-![Results](screenshots/results.png)
+<p align="center"><img src="screenshots/results.png" width="380"></p>
 
-![Demo](screenshots/demo.gif)
+<p align="center"><img src="screenshots/demo.gif" width="380"></p>
 
 ---
 
