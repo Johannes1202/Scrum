@@ -976,8 +976,7 @@ async def _auto_apply_results() -> tuple[int, int]:
     for espn_match in espn:
         if not espn_match.get("espn_id"):
             continue
-        slug = re.sub(r"[^a-z0-9]+", "-",
-                      f"{espn_match['team_home']}-vs-{espn_match['team_away']}".lower()).strip("-")
+        slug = espn_match["espn_id"]
         async with _db.execute(
             "SELECT match_id FROM match_results WHERE match_id=?", (slug,)
         ) as cur:
@@ -1235,6 +1234,7 @@ async def _fetch_espn_upcoming() -> list[dict]:
                     "tournament": slug,
                     "tournament_name": league_name,
                     "espn_id": event.get("id", ""),
+                    "slug": event.get("id", ""),
                     "league_id": league_id,
                     "team_home": home["team"]["displayName"],
                     "team_away": away["team"]["displayName"],
