@@ -1128,7 +1128,13 @@ async def _pre_fetch_squads() -> None:
         if not kts or kts <= now or kts > now + 72 * 3600:
             continue
         if espn_id in _pre_fetched_squads:
-            continue
+            async with _db.execute(
+                "SELECT COUNT(*) FROM players WHERE last_seen_match=? LIMIT 1", (espn_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row and row[0] > 0:
+                continue
+            _pre_fetched_squads.discard(espn_id)
         await _harvest_players(espn_id, league_id)
         _pre_fetched_squads.add(espn_id)
         logger.info("Pre-fetched squad for ESPN event %s (%s vs %s)", espn_id, m["team_home"], m["team_away"])
