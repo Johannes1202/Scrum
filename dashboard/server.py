@@ -1,5 +1,5 @@
 """
-server.py — Rugby Streams: dashboard, chat, predictions, leaderboard.
+server.py — Scrum: rugby prediction league dashboard.
 """
 
 import asyncio
