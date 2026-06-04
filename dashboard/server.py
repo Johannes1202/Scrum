@@ -1626,7 +1626,7 @@ def _join_page(token: str, username: str) -> str:
 </style></head><body>
 <div class="join-wrap">
   <div class="join-box">
-    <div class="join-logo">Rugby<span>.</span>Streams</div>
+    <div class="join-logo">Scrum</div>
     <div>You've been invited to join as <strong>{_esc(username)}</strong>.</div>
     <div class="join-sub">Click below to activate your account and go to the site.</div>
     <form method="post" action="/join/{_esc(token)}">
@@ -1696,7 +1696,7 @@ body{{display:flex;align-items:center;justify-content:center;background-image:ra
 .box-title span{{color:var(--accent)}}form{{display:flex;flex-direction:column;gap:.9rem}}input{{width:100%}}
 </style></head><body>
 <div class="box">
-  <div class="box-title">Rugby<span>.</span>Streams</div>
+  <div class="box-title">Scrum</div>
   <form method="post" action="/login">
     <input type="text" name="username" placeholder="Username" autofocus autocomplete="username">
     <input type="password" name="password" placeholder="Password" autocomplete="current-password">
