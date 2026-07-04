@@ -49,6 +49,7 @@ def _avatar_url(username: str) -> str | None:
 
 # Single source of truth for all supported leagues: slug → (espn_id, display_name)
 ALL_ESPN_LEAGUES = {
+    "nations-championship": (17567, "Nations Championship"),
     "six-nations":        (180659, "Six Nations"),
     "rugby-championship": (244293, "Rugby Championship"),
     "super-rugby":        (242041, "Super Rugby Pacific"),
@@ -66,6 +67,7 @@ ESPN_LEAGUES = {k: v[0] for k, v in ALL_ESPN_LEAGUES.items()}
 
 # Standings page tabs
 STANDINGS_TABS = [
+    ("nations-championship", "Nations Championship", 17567),
     ("world-cup",          "World Cup",          164205),
     ("six-nations",        "Six Nations",         180659),
     ("rugby-championship", "Rugby Championship",  244293),
@@ -404,7 +406,7 @@ async def _init_db():
         except Exception:
             pass
     # Global group: enable all prediction types by default
-    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts", "motm"):
+    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts"):
         try:
             await _db.execute(
                 "INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type) VALUES(1,?)", (pt,)
@@ -519,8 +521,7 @@ def _calc_margin_band(diff: int) -> str:
 async def _score_group(group_id: int, match_id: str, tournament: str,
                        fh: int, fa: int, res_winner: str, res_margin: str, res_btts: int,
                        res_try_scorers: list | None = None,
-                       res_first_try: str | None = None,
-                       res_motm: str | None = None) -> None:
+                       res_first_try: str | None = None) -> None:
     """Calculate and upsert leaderboard points for all group members who predicted this match."""
     async with _db.execute(
         "SELECT league_slug FROM group_leagues WHERE group_id=?", (group_id,)
@@ -537,7 +538,7 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
     async with _db.execute(
         """SELECT gm.username, p.score_home, p.score_away,
                   p.pred_winner, p.pred_margin, p.pred_btts,
-                  p.pred_try_any, p.pred_try_first, p.pred_motm,
+                  p.pred_try_any, p.pred_try_first,
                   p.is_banker
            FROM group_members gm
            JOIN predictions p ON p.username=gm.username AND p.match_id=?
@@ -576,9 +577,6 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
         if "try_first" in pred_types and p["pred_try_first"] and res_first_try:
             if p["pred_try_first"] == res_first_try:
                 ptf = 4
-        if "motm" in pred_types and p["pred_motm"] and res_motm:
-            if p["pred_motm"] == res_motm:
-                pmo = 3
 
         pts = ps + pw + pm + pb + pta + ptf + pmo
         banker_bonus = 0
@@ -656,240 +654,6 @@ async def _fetch_try_scorers(espn_id: str, league_id: int) -> tuple[list[dict], 
     except Exception as exc:
         logger.warning("Try scorer fetch error for %s: %s", espn_id, exc)
         return [], None
-
-
-_MOTM_RSS_FEEDS = [
-    "https://www.rugbypass.com/feeds/rss",
-    "https://feeds.bbci.co.uk/sport/rugby-union/rss.xml",
-    "https://www.theroar.com.au/category/rugby-union/feed/",
-    "https://www.espn.com/espn/rss/rugby/news",
-]
-_MOTM_SKIP_TITLE = {"takes:", "preview:", "preview", "prediction", "betting", "odds",
-                    "tips:", "team news", "squad", "selection", "named", "preview:"}
-# Article titles that indicate a player ratings piece (best-guess MOTM source)
-_MOTM_RATINGS_TITLE = {"player ratings", "ratings vs", "ratings:"}
-
-
-def _extract_motm_from_html(html: str, article_url: str, article_title: str = "") -> tuple[str | None, str]:
-    """Extract MOTM from article HTML.
-    Returns (player_name_or_None, confidence) where confidence is ‘confirmed’ or ‘estimated’."""
-    _STRIP_TAIL = {"the", "a", "an", "as", "for", "in", "of", "and", "but", "with",
-                   "to", "at", "who", "his", "her", "their"}
-    _STRIP_HEAD = {"captain", "captain.", "lock", "flanker", "prop", "hooker", "wing",
-                   "fly-half", "scrum-half", "fullback", "number", "centre", "center",
-                   "former", "star", "brilliant", "outstanding", "skipper"}
-
-    def _clean(raw: str) -> str | None:
-        words = raw.strip().split()
-        while words and words[-1].lower() in _STRIP_TAIL:
-            words.pop()
-        while words and words[0].lower().rstrip(".") in _STRIP_HEAD:
-            words.pop(0)
-        if not (2 <= len(words) <= 4):
-            return None
-        # All words must start uppercase — filters regex false positives from IGNORECASE
-        if not all(w[0].isupper() for w in words if w):
-            return None
-        return " ".join(words)
-
-    # Name pattern: 2-4 capitalized words (proper noun)
-    NAME = r"([A-Z][a-zA-Z’-]+(?: [A-Z][a-zA-Z’-]+)+)"
-
-    # Formal patterns — confirmed MOTM, checked across all blocks
-    formal_patterns = [
-        rf"(?:\w+\s+)?(?:man|player)\s+of\s+the\s+match[:\s]+{NAME}",   # sponsor prefix ok
-        rf"motm[:\s]+{NAME}",
-        rf"{NAME}\s+(?:was\s+)?(?:named|voted|crowned|wins?|takes?|claimed?)\s+(?:the\s+)?(?:man|player)\s+of\s+the\s+match",
-        rf"{NAME}\s+(?:was\s+)?(?:named|voted|crowned)\s+(?:the\s+)?(?:best\s+(?:player|on\s+ground)|bog\b)",
-        rf"best\s+on\s+ground[:\s]+{NAME}",
-        rf"bog[:\s]+{NAME}",
-        rf"(?:man|player)\s+of\s+the\s+match.*?(?:goes\s+to|is|was|:)\s+{NAME}",
-    ]
-    # Estimated patterns — informal signals, checked on h1 + first 4 paragraphs only
-    informal_patterns = [
-        rf"{NAME}\s+was\s+the\s+(?:standout\s+)?hero",
-        rf"{NAME}\s+(?:starred?|shone|shines?|stood\s+out|led\s+the\s+way)\s+(?:for|as)\b",
-        rf"star\s+of\s+the\s+(?:show|night|game|match)[:\s]+{NAME}",
-        rf"{NAME}\s+pick(?:ed)?\s+up\s+(?:the\s+)?(?:man|player)\s+of\s+the\s+match",
-        rf"(?:the\s+)?outstanding\s+{NAME}",
-        rf"{NAME}\s+inspired\s+[A-Z]",
-        rf"{NAME}\s+was\s+(?:simply\s+)?(?:outstanding|immense|magnificent|sensational)\b",
-    ]
-
-    soup = BeautifulSoup(html, "html.parser")
-    all_blocks = soup.find_all(["p", "h1", "h2", "h3", "li", "strong", "b"])
-
-    # 1. Formal MOTM across all blocks → confirmed
-    for block in all_blocks:
-        text = block.get_text().strip()
-        if not text:
-            continue
-        for pattern in formal_patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                name = _clean(m.group(1))
-                if name:
-                    return name, "confirmed"
-
-    h1 = soup.find("h1")
-    title_text = h1.get_text().strip() if h1 else ""
-    if not title_text:
-        tag = soup.find("title")
-        title_text = tag.get_text().strip() if tag else ""
-
-    # 2. Player ratings article → extract highest-rated player → estimated
-    tl = (article_title or title_text).lower()
-    is_ratings = any(kw in tl for kw in _MOTM_RATINGS_TITLE)
-    if is_ratings:
-        best_name, best_rating = None, 0
-        for block in all_blocks:
-            text = block.get_text().strip()
-            # Formats: "8. Billy Vunipola – 9" or "Billy Vunipola - 9/10" or "Billy Vunipola 9/10"
-            m = re.search(
-                r"(?:^\d+\.\s+)?([A-Z][a-zA-Z’-]+(?: [A-Z][a-zA-Z’-]+)+)\s*[–\-]\s*(\d+)(?:/10)?",
-                text
-            )
-            if not m:
-                # Try alternate: name followed by score on next line / in same block
-                m = re.search(
-                    r"([A-Z][a-zA-Z’-]+(?: [A-Z][a-zA-Z’-]+)+)\s+(\d+)/10",
-                    text
-                )
-            if m:
-                try:
-                    rating = int(m.group(2))
-                except (ValueError, IndexError):
-                    continue
-                if 1 <= rating <= 10 and rating > best_rating:
-                    name = _clean(m.group(1))
-                    if name:
-                        best_name, best_rating = name, rating
-        if best_name and best_rating >= 8:
-            return best_name, "estimated"
-
-    # 3. Informal patterns on h1 + opening paragraphs → estimated
-    focus_texts = [title_text] + [p.get_text().strip() for p in soup.find_all("p")[:4]]
-    for text in focus_texts:
-        for pattern in informal_patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                name = _clean(m.group(1))
-                if name:
-                    return name, "estimated"
-
-    # 4. Headline hero/star → estimated
-    m = re.match(
-        rf"^{NAME}\s+(?:the\s+)?(?:hero|star|stars|shines|inspires|leads?)\b",
-        title_text, re.IGNORECASE
-    )
-    if m:
-        name = _clean(m.group(1))
-        if name:
-            return name, "estimated"
-
-    return None, "none"
-
-
-def _find_article_in_rss(rss_text: str, home_keys: list[str], away_keys: list[str],
-                         home_slug: str, away_slug: str) -> tuple[str | None, str | None]:
-    """Scan RSS XML for an article matching both teams. Returns (url, title)."""
-    items = re.findall(r"<item>(.*?)</item>", rss_text, re.DOTALL)
-    candidates = []
-    for item in items:
-        title_m = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
-        link_m = re.search(r"<link>(.*?)</link>", item, re.DOTALL)
-        if not title_m or not link_m:
-            continue
-        title = re.sub(r"<!\[CDATA\[|\]\]>", "", title_m.group(1)).strip()
-        link = link_m.group(1).strip()
-        tl = title.lower()
-        home_match = any(k in tl for k in home_keys)
-        away_match = any(k in tl for k in away_keys)
-        if home_match and away_match:
-            is_skip = any(skip in tl for skip in _MOTM_SKIP_TITLE)
-            candidates.append((link, title, is_skip))
-
-    # Prefer non-skip articles (match reports > analysis)
-    for url, title, skip in candidates:
-        if not skip:
-            return url, title
-    # Fall back to any match
-    if candidates:
-        return candidates[0][0], candidates[0][1]
-    return None, None
-
-
-async def _scrape_motm(team_home: str, team_away: str, event_ts: float) -> tuple[str | None, str]:
-    """Find MOTM by scanning multiple public RSS feeds then extracting from matched articles.
-    No API keys required — deployable by anyone."""
-    home_slug = re.sub(r"[^a-z0-9]+", "-", team_home.lower()).strip("-")
-    away_slug = re.sub(r"[^a-z0-9]+", "-", team_away.lower()).strip("-")
-    # Use multiple keys per team: first chunk + last meaningful word
-    # Handles "New South Wales Waratahs" → also checks "warat" not just "new-s"
-    def _team_keys(slug: str) -> list[str]:
-        words = [w for w in slug.split("-") if len(w) > 3]
-        keys = [slug[:5]]
-        if words and words[-1] not in keys:
-            keys.append(words[-1][:6])
-        if len(words) > 1 and words[0][:5] not in keys:
-            keys.append(words[0][:5])
-        return keys
-    home_keys = _team_keys(home_slug)
-    away_keys = _team_keys(away_slug)
-    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-
-    logger.info("MOTM scrape: %s vs %s (home_keys=%s away_keys=%s)", team_home, team_away, home_keys, away_keys)
-
-    try:
-        results: list[tuple[str, str, str]] = []  # (motm_name, source_feed, article_url)
-
-        for feed_url in _MOTM_RSS_FEEDS:
-            try:
-                rss = await _http_client.get(feed_url, timeout=10, headers=ua)
-                if rss.status_code != 200:
-                    logger.info("MOTM feed %s: HTTP %s", feed_url, rss.status_code)
-                    continue
-                article_url, article_title = _find_article_in_rss(
-                    rss.text, home_keys, away_keys, home_slug, away_slug
-                )
-                if not article_url:
-                    logger.info("MOTM feed %s: no matching article", feed_url)
-                    continue
-                logger.info("MOTM feed %s: found '%s'", feed_url, article_title)
-                art = await _http_client.get(article_url, timeout=12, headers=ua)
-                if art.status_code != 200:
-                    continue
-                name, confidence = _extract_motm_from_html(art.text, article_url, article_title or "")
-                if name:
-                    logger.info("MOTM extracted from %s: %s (%s)", feed_url, name, confidence)
-                    results.append((name, confidence, feed_url, article_url))
-            except Exception as feed_exc:
-                logger.info("MOTM feed %s error: %s", feed_url, feed_exc)
-                continue
-
-        if not results:
-            debug = f"no_result:home={home_keys} away={away_keys} feeds_tried={len(_MOTM_RSS_FEEDS)}"
-            logger.warning("MOTM: %s", debug)
-            return None, debug
-
-        # Prefer confirmed over estimated; then pick most agreed-upon name
-        confirmed = [(n, c, f, u) for n, c, f, u in results if c == "confirmed"]
-        pool = confirmed if confirmed else results
-        names = [r[0] for r in pool]
-        winner = max(set(names), key=names.count)
-        best = next(r for r in pool if r[0] == winner)
-        confidence = best[1]
-        source = best[2].split("/")[2]
-        url = best[3]
-        prefix = "found" if confidence == "confirmed" else "estimated"
-        debug = f"{prefix}:{winner} source={source} confidence={confidence} url={url}"
-        logger.info("MOTM final: %s (%s, %s)", winner, confidence, source)
-        return winner, debug
-
-    except Exception as exc:
-        debug = f"exception:{type(exc).__name__}:{exc}"
-        logger.warning("MOTM scrape exception for %s vs %s: %s", team_home, team_away, debug)
-        return None, debug
 
 
 async def _auto_apply_results() -> tuple[int, int]:
@@ -1000,7 +764,7 @@ async def _auto_apply_results() -> tuple[int, int]:
                  winner, margin, btts),
             )
             await _db.commit()
-            # Queue try scorer + MOTM fetch in background
+            # Queue try scorer fetch in background
             asyncio.create_task(_resolve_and_rescore(
                 slug, espn_match["tournament"],
                 espn_match["espn_id"], espn_match["league_id"],
@@ -1020,7 +784,7 @@ async def _resolve_and_rescore(match_id: str, tournament: str,
                                espn_id: str, league_id: int,
                                team_home: str, team_away: str, event_ts: float,
                                fh: int, fa: int, winner: str, margin: str, btts: int) -> None:
-    """Background task: fetch try scorers + MOTM, update match_results, re-score all groups."""
+    """Background task: fetch try scorers, update match_results, re-score all groups."""
     # ESPN rugby try scorer data can take 5-20 minutes to populate post-match.
     # Retry up to 3 times before giving up.
     try_scorers: list[dict] = []
@@ -1035,26 +799,14 @@ async def _resolve_and_rescore(match_id: str, tournament: str,
                     match_id, attempt + 1,
                     "retrying" if attempt < 2 else "giving up")
 
-    motm, motm_debug = await _scrape_motm(team_home, team_away, event_ts)
-    motm_pending = 1 if motm is None else 0
-
     try_scorers_json = json.dumps(try_scorers) if try_scorers else None
 
-    try:
-        await _db.execute(
-            """UPDATE match_results SET
-                 res_try_scorers=?, res_first_try=?, res_motm=?, motm_pending=?, motm_scrape_debug=?
-               WHERE match_id=?""",
-            (try_scorers_json, first_try, motm, motm_pending, motm_debug, match_id),
-        )
-    except Exception:
-        # motm_scrape_debug column may not exist on older DBs — fall back
-        await _db.execute(
-            """UPDATE match_results SET
-                 res_try_scorers=?, res_first_try=?, res_motm=?, motm_pending=?
-               WHERE match_id=?""",
-            (try_scorers_json, first_try, motm, motm_pending, match_id),
-        )
+    await _db.execute(
+        """UPDATE match_results SET
+             res_try_scorers=?, res_first_try=?
+           WHERE match_id=?""",
+        (try_scorers_json, first_try, match_id),
+    )
     await _db.commit()
 
     async with _db.execute("SELECT id FROM groups") as cur:
@@ -1063,12 +815,12 @@ async def _resolve_and_rescore(match_id: str, tournament: str,
         try:
             await _score_group(gid, match_id, tournament, fh, fa,
                                winner, margin, btts,
-                               try_scorers, first_try, motm)
+                               try_scorers, first_try)
         except Exception as exc:
             logger.warning("Re-score group %d error: %s", gid, exc)
 
-    logger.info("Resolved %s: tries=%s first=%s motm=%s pending=%s",
-                match_id, try_scorers, first_try, motm, bool(motm_pending))
+    logger.info("Resolved %s: tries=%s first=%s",
+                match_id, try_scorers, first_try)
 
 
 async def _harvest_players(match_id: str, league_id: int) -> None:
@@ -1140,56 +892,6 @@ async def _pre_fetch_squads() -> None:
         logger.info("Pre-fetched squad for ESPN event %s (%s vs %s)", espn_id, m["team_home"], m["team_away"])
 
 
-async def _retry_pending_motm() -> None:
-    """Retry MOTM scrape for any matches flagged pending. Gives up after 48h."""
-    cutoff = time.time() - 172800  # 48 hours
-    async with _db.execute(
-        "SELECT match_id, match_title, team_home, team_away, kickoff_ts, tournament, "
-        "final_home, final_away, res_winner, res_margin, res_btts, res_try_scorers, res_first_try "
-        "FROM match_results WHERE motm_pending=1 AND kickoff_ts > ?",
-        (cutoff,),
-    ) as cur:
-        pending = [dict(r) for r in await cur.fetchall()]
-
-    for r in pending:
-        motm, debug = await _scrape_motm(r["team_home"], r["team_away"], r["kickoff_ts"])
-        if motm:
-            logger.info("MOTM retry success for %s: %s", r["match_id"], motm)
-            try:
-                await _db.execute(
-                    "UPDATE match_results SET res_motm=?, motm_pending=0, motm_scrape_debug=? WHERE match_id=?",
-                    (motm, debug, r["match_id"]),
-                )
-            except Exception:
-                await _db.execute(
-                    "UPDATE match_results SET res_motm=?, motm_pending=0 WHERE match_id=?",
-                    (motm, r["match_id"]),
-                )
-            await _db.commit()
-
-            try_scorers = json.loads(r.get("res_try_scorers") or "[]") or []
-            async with _db.execute("SELECT id FROM groups") as cur:
-                group_ids = [row["id"] for row in await cur.fetchall()]
-            for gid in group_ids:
-                try:
-                    await _score_group(gid, r["match_id"], r["tournament"],
-                                       r["final_home"], r["final_away"],
-                                       r["res_winner"], r["res_margin"], r["res_btts"],
-                                       try_scorers, r.get("res_first_try"), motm)
-                except Exception as exc:
-                    logger.warning("MOTM retry rescore group %d: %s", gid, exc)
-        else:
-            logger.info("MOTM retry: still no result for %s (%s)", r["match_id"], debug)
-            try:
-                await _db.execute(
-                    "UPDATE match_results SET motm_scrape_debug=? WHERE match_id=?",
-                    (f"retry:{debug}", r["match_id"]),
-                )
-                await _db.commit()
-            except Exception:
-                pass
-
-
 async def _auto_fetch_loop():
     """Background task: auto-fetch results every 60 minutes."""
     await asyncio.sleep(120)  # 2-min grace period on startup
@@ -1200,7 +902,6 @@ async def _auto_fetch_loop():
             if applied:
                 logger.info("Auto-fetch: applied %d/%d results", applied, checked)
             await _pre_fetch_squads()
-            await _retry_pending_motm()
         except Exception as exc:
             logger.warning("Auto-fetch loop error: %s", exc)
         await asyncio.sleep(3600)  # every hour
@@ -1747,7 +1448,7 @@ async def api_match_predictions(request: Request, match_id: str):
     # Include full result data for the match breakdown panel
     async with _db.execute(
         """SELECT final_home, final_away, res_winner, res_margin, res_btts,
-                  res_try_scorers, res_first_try, res_motm
+                  res_try_scorers, res_first_try
            FROM match_results WHERE match_id=?""",
         (match_id,),
     ) as cur:
@@ -1760,7 +1461,6 @@ async def api_match_predictions(request: Request, match_id: str):
         result["margin"]      = result_row["res_margin"]
         result["btts"]        = result_row["res_btts"]
         result["first_try"]   = result_row["res_first_try"]
-        result["motm"]        = result_row["res_motm"]
         try:
             raw = json.loads(result_row["res_try_scorers"] or "[]")
             # Support both old format (list of strings) and new format (list of dicts)
@@ -1804,7 +1504,6 @@ PREDICTION_TYPES = [
     ("try_anytime","Anytime Try Scorer",    "Pick a player who scores a try at any point.",               "auto"),
     ("try_first",  "First Try Scorer",      "Pick the player who scores the very first try.",             "auto"),
     ("btts",       "Both Teams to Score",   "Will both teams score at least one try?",                   "auto"),
-    ("motm",       "Man of the Match",      "Pick the player of the match.",                             "manual"),
 ]
 # resolve_type: "auto" = ESPN resolves it; "manual" = admin may need to enter it
 PRED_RESOLVE = {k: r for k, _, _, r in PREDICTION_TYPES}
@@ -2074,10 +1773,10 @@ async def me_page(request: Request):
     async with _db.execute(
         """SELECT p.score_home, p.score_away,
                   p.pred_winner, p.pred_margin, p.pred_btts,
-                  p.pred_try_any, p.pred_try_first, p.pred_motm,
+                  p.pred_try_any, p.pred_try_first,
                   r.final_home, r.final_away,
                   r.res_winner, r.res_margin, r.res_btts,
-                  r.res_try_scorers, r.res_first_try, r.res_motm
+                  r.res_try_scorers, r.res_first_try
            FROM predictions p
            JOIN match_results r ON r.match_id = p.match_id
            WHERE p.username = ?""",
@@ -2096,7 +1795,6 @@ async def me_page(request: Request):
     b_pred = b_hit = 0
     ta_pred = ta_hit = 0
     tf_pred = tf_hit = 0
-    mo_pred = mo_hit = 0
 
     for rp in resolved_preds:
         if rp["pred_winner"] and rp["res_winner"]:
@@ -2121,9 +1819,6 @@ async def me_page(request: Request):
         if rp["pred_try_first"] and rp["res_first_try"]:
             tf_pred += 1
             if rp["pred_try_first"] == rp["res_first_try"]: tf_hit += 1
-        if rp["pred_motm"] and rp["res_motm"]:
-            mo_pred += 1
-            if rp["pred_motm"] == rp["res_motm"]: mo_hit += 1
 
     # Score accuracy — use resolved predictions count (not leaderboard rows)
     s_pred = len(resolved_preds)
@@ -2139,7 +1834,6 @@ async def me_page(request: Request):
         ("Both Teams Scored", b_pred,    b_hit,        "correct"),
         ("Anytime Try",     ta_pred,     ta_hit,       "correct"),
         ("First Try",       tf_pred,     tf_hit,       "correct"),
-        ("Man of the Match",mo_pred,     mo_hit,       "correct"),
     ]
 
     type_rows_html = ""
@@ -2941,7 +2635,6 @@ async def groups_create_get(request: Request):
 .res-badge{{display:inline-block;font-size:.65rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;padding:.1rem .4rem;border-radius:4px;vertical-align:middle;margin-left:.35rem}}
 .res-auto{{background:rgba(34,197,94,.12);color:#22c55e;border:1px solid rgba(34,197,94,.25)}}
 .res-manual{{background:rgba(251,191,36,.1);color:#f59e0b;border:1px solid rgba(251,191,36,.25)}}
-.motm-note{{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.2);border-radius:8px;padding:.75rem 1rem;font-size:.82rem;color:#f59e0b;margin-top:.75rem;display:none}}
 .actions{{display:flex;gap:.75rem;margin-top:1.25rem}}
 </style></head><body>
 {_nav(username, is_admin, "groups")}
@@ -2960,9 +2653,6 @@ async def groups_create_get(request: Request):
     <div class="form-section">
       <div class="section-label">Prediction Types</div>
       {pred_rows}
-      <div class="motm-note" id="motm-note">
-        <strong>Heads up:</strong> Man of the Match auto-resolves from Rugbypass for most major competitions (World Cup, Six Nations, Rugby Championship, Premiership). For smaller leagues, you may occasionally need to enter it manually in the admin panel.
-      </div>
     </div>
     <div class="actions">
       <button type="submit" class="btn">Create Group</button>
@@ -2971,12 +2661,6 @@ async def groups_create_get(request: Request):
   </form>
 </div>
 {_bnav("groups", 0, is_admin)}
-<script>
-const motmCb = document.querySelector('input[value="motm"]');
-const note = document.getElementById('motm-note');
-function updateNote(){{ note.style.display = motmCb && motmCb.checked ? 'block' : 'none'; }}
-if(motmCb){{ motmCb.addEventListener('change', updateNote); updateNote(); }}
-</script>
 </body></html>""")
 
 
@@ -3177,7 +2861,6 @@ async def group_home(request: Request, slug: str):
         has_margin = show_cols.get("margin") and any(r.get("pts_margin") for r in rows)
         has_btts   = show_cols.get("btts")   and any(r.get("pts_btts") for r in rows)
         has_try    = (show_cols.get("try_anytime") or show_cols.get("try_first")) and any((r.get("pts_try_any",0) or 0)+(r.get("pts_try_first",0) or 0) for r in rows)
-        has_motm   = show_cols.get("motm")   and any(r.get("pts_motm") for r in rows)
         has_banker = any(r.get("pts_banker") for r in rows)
         simple_s = detail_s = ""
         for i, r in enumerate(rows, 1):
@@ -3197,7 +2880,6 @@ async def group_home(request: Request, slug: str):
             if has_margin: opt += f'<td class="lb-num">{r.get("pts_margin",0) or 0}</td>'
             if has_btts:   opt += f'<td class="lb-num">{r.get("pts_btts",0) or 0}</td>'
             if has_try:    opt += f'<td class="lb-num">{(r.get("pts_try_any",0) or 0)+(r.get("pts_try_first",0) or 0)}</td>'
-            if has_motm:   opt += f'<td class="lb-num">{r.get("pts_motm",0) or 0}</td>'
             bkr = r.get("pts_banker", 0) or 0
             if has_banker: opt += f'<td class="lb-num" style="color:var(--accent3)">+{bkr}</td>'
             detail_s += (f'<tr{you}><td class="lb-rank">{medal}</td>'
@@ -3212,7 +2894,6 @@ async def group_home(request: Request, slug: str):
         if has_margin: opt_hdr += '<th class="lb-num">Mrg</th>'
         if has_btts:   opt_hdr += '<th class="lb-num">BTS</th>'
         if has_try:    opt_hdr += '<th class="lb-num">Try</th>'
-        if has_motm:   opt_hdr += '<th class="lb-num">MOTM</th>'
         if has_banker: opt_hdr += '<th class="lb-num">🔒</th>'
         sid = f"lbs-{gid_str}"
         did = f"lbd-{gid_str}"
@@ -3229,7 +2910,7 @@ async def group_home(request: Request, slug: str):
   <th class="lb-num">Avg</th><th class="lb-total">Pts</th>
 </tr></thead><tbody>{detail_s}</tbody></table></div></div>"""
 
-    show_cols = {pt: pt in pred_types for pt in ("winner","margin","btts","try_anytime","try_first","motm")}
+    show_cols = {pt: pt in pred_types for pt in ("winner","margin","btts","try_anytime","try_first")}
 
     for league_slug in leagues:
         league_name = ALL_ESPN_LEAGUES.get(league_slug, (None, league_slug))[1]
@@ -3307,7 +2988,7 @@ async def group_home(request: Request, slug: str):
         # 4. Recent results for this group + league
         async with _db.execute(
             """SELECT r.match_id, r.match_title, r.final_home, r.final_away, r.kickoff_ts,
-                      r.res_motm, COUNT(p.id) as pred_count
+                      COUNT(p.id) as pred_count
                FROM match_results r
                JOIN predictions p ON r.match_id=p.match_id
                JOIN group_members gm ON p.username=gm.username AND gm.group_id=?
@@ -3320,10 +3001,9 @@ async def group_home(request: Request, slug: str):
         for m in recent:
             dt = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%d %b %Y") if m["kickoff_ts"] else ""
             mid = _esc(m["match_id"])
-            motm_tag = f'<span class="mr-motm">⭐ {_esc(m["res_motm"])}</span>' if m.get("res_motm") else ""
             m_rows += (f'<div class="match-result-row" data-mid="{mid}" onclick="togglePreds(this)">'
                        f'<span class="mr-date">{dt}</span>'
-                       f'<span class="mr-title">{_esc(m["match_title"])}{motm_tag}</span>'
+                       f'<span class="mr-title">{_esc(m["match_title"])}</span>'
                        f'<span class="mr-score">{m["final_home"]}—{m["final_away"]}</span>'
                        f'<span class="mr-cnt">{m["pred_count"]} pick{"s" if m["pred_count"]!=1 else ""}</span>'
                        f'<span class="mr-chevron material-symbols-outlined">chevron_right</span>'
@@ -3465,7 +3145,6 @@ async def group_home(request: Request, slug: str):
 .mr-chevron{{color:var(--accent);font-size:1rem;transition:transform .2s;flex-shrink:0;opacity:.7}}
 .match-result-row.open .mr-chevron{{transform:rotate(90deg);opacity:1}}
 .mr-breakdown{{display:none;border:1px solid var(--border);border-top:none;border-radius:0 0 6px 6px;margin-bottom:.3rem}}
-.mr-motm{{display:block;font-size:.7rem;color:var(--accent3);font-weight:600;margin-top:.15rem;letter-spacing:.01em}}
 .mr-breakdown.open{{display:block}}
 .mr-bd-row{{display:flex;align-items:center;gap:.75rem;padding:.5rem .75rem;border-bottom:1px solid var(--border);font-size:.84rem}}.mr-bd-row:last-child{{border-bottom:none}}
 .mr-bd-row.me{{background:rgba(0,176,255,.04)}}
@@ -3512,7 +3191,7 @@ async function togglePreds(row){{
       const isMe=p.username===d.me,exact=p.exact_score?'<span class="mr-bd-exact" style="font-size:.65rem;font-weight:700;color:var(--accent3);background:rgba(255,145,0,.12);border:1px solid rgba(255,145,0,.25);border-radius:3px;padding:.05rem .25rem;margin-left:.25rem">EXACT</span>':'';
       html+=`<div class="mr-bd-row${{isMe?' me':''}}"><span class="mr-bd-name">${{p.username.charAt(0).toUpperCase()+p.username.slice(1)}}${{exact}}</span><span class="mr-bd-pred">${{p.score_home}}–${{p.score_away}}</span><span class="mr-bd-diff">${{p.diff!=null?'diff '+p.diff:'—'}}</span><span class="mr-bd-pts">${{p.points!=null?p.points+'pts':'—'}}</span></div>`;
     }});
-    if(d.result&&(d.result.winner||d.result.try_scorers?.length||d.result.motm)){{
+    if(d.result&&(d.result.winner||d.result.try_scorers?.length)){{
       const r=d.result;
       const winLabel=r.winner?r.winner.charAt(0).toUpperCase()+r.winner.slice(1):'—';
       const bttsLabel=r.btts!=null?(r.btts?'Yes':'No'):null;
@@ -3532,7 +3211,6 @@ async function togglePreds(row){{
       }}else if(r.try_scorers&&r.try_scorers.length){{
         html+=`<div class="mr-result-row"><span class="mr-result-label">Try Scorers</span><span class="mr-result-val">${{r.try_scorers.join(', ')}}</span></div>`;
       }}
-      if(r.motm)html+=`<div class="mr-result-row"><span class="mr-result-label">Man of the Match</span><span class="mr-result-val">⭐ ${{r.motm}}</span></div>`;
       html+='</div>';
     }}
     _predCache[mid]=html;bd.innerHTML=html;
@@ -4012,7 +3690,6 @@ async def group_settings_get(request: Request, slug: str, delete_error: str = ""
 .res-badge{{display:inline-block;font-size:.65rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;padding:.1rem .4rem;border-radius:4px;vertical-align:middle;margin-left:.35rem}}
 .res-auto{{background:rgba(34,197,94,.12);color:#22c55e;border:1px solid rgba(34,197,94,.25)}}
 .res-manual{{background:rgba(251,191,36,.1);color:#f59e0b;border:1px solid rgba(251,191,36,.25)}}
-.motm-note{{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.2);border-radius:8px;padding:.75rem 1rem;font-size:.82rem;color:#f59e0b;margin-top:.75rem;display:none}}
 table{{width:100%;border-collapse:collapse}}td{{padding:.5rem .3rem;border-bottom:1px solid var(--border)}}tr:last-child td{{border-bottom:none}}
 </style></head><body>
 {_nav(username, is_admin, "groups")}
@@ -4031,9 +3708,6 @@ table{{width:100%;border-collapse:collapse}}td{{padding:.5rem .3rem;border-botto
     <div class="form-section">
       <div class="section-label">Prediction Types</div>
       {pred_rows}
-      <div class="motm-note" id="motm-note">
-        <strong>Heads up:</strong> Man of the Match auto-resolves for major competitions. For smaller leagues, occasional manual entry in the admin panel may be needed.
-      </div>
     </div>
     <div style="display:flex;gap:.75rem;margin-top:.5rem">
       <button type="submit" class="btn">Save Changes</button>
@@ -4048,12 +3722,6 @@ table{{width:100%;border-collapse:collapse}}td{{padding:.5rem .3rem;border-botto
   {delete_section_html}
 </div>
 {_bnav("groups", 0, is_admin)}
-<script>
-const motmCb = document.querySelector('input[value="motm"]');
-const note = document.getElementById('motm-note');
-function updateNote(){{ note.style.display = motmCb && motmCb.checked ? 'block' : 'none'; }}
-if(motmCb){{ motmCb.addEventListener('change', updateNote); updateNote(); }}
-</script>
 </body></html>""")
 
 
@@ -4607,10 +4275,10 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
             active_pred_types.update(g_types)
     active_pred_types.discard("score")  # score is always shown
 
-    # Player pool for try scorer / MOTM
+    # Player pool for try scorer predictions
     player_pool_home: list[tuple] = []  # (name, jersey)
     player_pool_away: list[tuple] = []
-    if "try_anytime" in active_pred_types or "try_first" in active_pred_types or "motm" in active_pred_types:
+    if "try_anytime" in active_pred_types or "try_first" in active_pred_types:
         async with _db.execute(
             "SELECT name, jersey FROM players WHERE team_name=? ORDER BY COALESCE(jersey,99), name",
             (team_home,),
@@ -4625,7 +4293,7 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
     # My prediction
     async with _db.execute(
         """SELECT score_home, score_away, pred_winner, pred_margin,
-                  pred_try_any, pred_try_first, pred_btts, pred_motm
+                  pred_try_any, pred_try_first, pred_btts
            FROM predictions WHERE match_id=? AND username=?""",
         (slug, username),
     ) as cur:
@@ -4717,12 +4385,6 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
   <div class="pef-label">First Try Scorer</div>
   {_player_select("pred_try_first", player_pool_home, player_pool_away, cur_tf)}
 </div>"""
-    if "motm" in active_pred_types:
-        cur_motm = (my_pred or {}).get("pred_motm") or ""
-        extra_fields += f"""<div class="pred-extra-field">
-  <div class="pef-label">Man of the Match</div>
-  {_player_select("pred_motm", player_pool_home, player_pool_away, cur_motm)}
-</div>"""
 
     # Build prediction form or status
     if my_pred:
@@ -4735,7 +4397,7 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
     <div class="pb-num">{my_pred['score_away']}</div>
     <div class="pb-team">{_esc(team_away)}</div>
   </div>
-  {''.join(f'<div class="pred-summary-row"><span class="psr-label">{PRED_LABEL.get(k,"")}</span><span class="psr-val">{_esc(str(v))}</span></div>' for k,v in [("winner",my_pred.get("pred_winner")),("margin",my_pred.get("pred_margin")),("btts","Yes" if my_pred.get("pred_btts")==1 else ("No" if my_pred.get("pred_btts")==0 else None)),("try_anytime",my_pred.get("pred_try_any")),("try_first",my_pred.get("pred_try_first")),("motm",my_pred.get("pred_motm"))] if v)}
+  {''.join(f'<div class="pred-summary-row"><span class="psr-label">{PRED_LABEL.get(k,"")}</span><span class="psr-val">{_esc(str(v))}</span></div>' for k,v in [("winner",my_pred.get("pred_winner")),("margin",my_pred.get("pred_margin")),("btts","Yes" if my_pred.get("pred_btts")==1 else ("No" if my_pred.get("pred_btts")==0 else None)),("try_anytime",my_pred.get("pred_try_any")),("try_first",my_pred.get("pred_try_first"))] if v)}
   <div style="font-size:.8rem;color:var(--muted);margin-top:.5rem">Locked — predictions cannot be changed.</div>
 </div>"""
     elif window_open:
@@ -4912,7 +4574,6 @@ async def api_predict(
     pred_btts: str = Form(default=""),
     pred_try_any: str = Form(default=""),
     pred_try_first: str = Form(default=""),
-    pred_motm: str = Form(default=""),
     is_banker: str = Form(default=""),
 ):
     username = _get_session_user(request)
@@ -4944,13 +4605,13 @@ async def api_predict(
         await _db.execute(
             """INSERT INTO predictions
                (match_id,match_title,team_home,team_away,kickoff_ts,tournament,username,
-                score_home,score_away,pred_winner,pred_margin,pred_btts,pred_try_any,pred_try_first,pred_motm,is_banker,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                score_home,score_away,pred_winner,pred_margin,pred_btts,pred_try_any,pred_try_first,is_banker,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (slug, match_title.strip(), team_home.strip(), team_away.strip(),
              kickoff_ts, tournament.strip(), username,
              score_home, score_away,
              pred_winner.strip() or None, pred_margin.strip() or None, btts_val,
-             pred_try_any.strip() or None, pred_try_first.strip() or None, pred_motm.strip() or None,
+             pred_try_any.strip() or None, pred_try_first.strip() or None,
              banker_val, time.time()),
         )
         await _db.commit()
@@ -5363,7 +5024,7 @@ async def how_to_play(request: Request):
     <div class="admin-label">Admin Guide</div>
     <h2>Creating a Group</h2>
     <p>Go to <strong>Groups → Create Group</strong>. Give it a name, pick which competitions to follow, and choose which prediction types your group will compete on.</p>
-    <p>Each prediction type is labelled — <span class="badge-auto">Auto-resolves</span> means the result is fetched automatically from ESPN after the match. <span class="badge-manual">May need manual entry</span> means Man of the Match, which usually auto-resolves from match reports but occasionally needs you to enter it by hand.</p>
+    <p>Every prediction type is <span class="badge-auto">Auto-resolved</span> — the result is fetched automatically from ESPN after the match, so there's nothing to enter by hand.</p>
     <p>You can change leagues and prediction types any time from <strong>Group → Settings</strong>.</p>
 
     <h2>Inviting People</h2>
@@ -5375,12 +5036,7 @@ async def how_to_play(request: Request):
     <p>You don't need to create accounts for people — the shareable link handles registration automatically.</p>
 
     <h2>Managing Members</h2>
-    <p>In <strong>Group → Settings</strong> you can promote any member to group admin (so they can share the load of managing invites and entering MOTM results) or remove members who are no longer playing.</p>
-
-    <h2>Man of the Match</h2>
-    <p>After each match, Scrum attempts to scrape the MOTM from online match reports. For major competitions — World Cup, Six Nations, Premiership, Rugby Championship — this works reliably. For smaller leagues it may not find it.</p>
-    <p>When auto-resolve fails, an <strong>amber warning</strong> appears at the top of the Admin panel listing the match and a text field to enter the name. Fill it in and hit Save — the leaderboard updates instantly.</p>
-    <p>MOTM is opt-in per group. If you don't want the occasional manual entry, just don't enable it when setting up your group.</p>
+    <p>In <strong>Group → Settings</strong> you can promote any member to group admin (so they can share the load of managing invites and results) or remove members who are no longer playing.</p>
 
     <h2>User Management</h2>
     <p>The site Admin panel (<strong>Admin</strong> in the nav) shows all registered users. From here you can:</p>
@@ -5481,14 +5137,9 @@ async def how_to_play(request: Request):
         <td>The player who scores the very first try</td>
         <td>+4</td>
       </tr>
-      <tr>
-        <td>Man of the Match</td>
-        <td>The official player of the match</td>
-        <td>+3</td>
-      </tr>
     </table>
     <p>Score points use a diff system — <span class="badge-exact">Exact</span> score = 5 pts, <span class="badge-closest">Closest</span> diff in your group = 3 pts, everyone else who predicted = 1 pt. All other types are right or wrong.</p>
-    <p>Maximum possible per match (all types enabled): <strong>20 pts</strong>. With a banker it doubles to <strong>40 pts</strong>.</p>
+    <p>Maximum possible per match (all types enabled): <strong>17 pts</strong>. With a banker it doubles to <strong>34 pts</strong>.</p>
   </div>
 
   <div class="htp-section">
@@ -5500,7 +5151,7 @@ async def how_to_play(request: Request):
   <div class="htp-section">
     <h2>Example</h2>
     <div class="htp-example">
-      <div class="ex-label">All Blacks 35 – 17 Argentina · Ardie Savea scores first try · MOTM: Sam Cane</div>
+      <div class="ex-label">All Blacks 35 – 17 Argentina · Ardie Savea scores first try</div>
       <table>
         <tr><td>Score: predicted <strong>35 – 17</strong></td><td>5 pts <span class="badge-exact">Exact</span></td></tr>
         <tr><td>Winner: predicted <strong>Home</strong> ✓</td><td>+2 pts</td></tr>
@@ -5508,16 +5159,15 @@ async def how_to_play(request: Request):
         <tr><td>Both teams score: predicted <strong>Yes</strong> ✓</td><td>+1 pt</td></tr>
         <tr><td>Anytime try scorer: picked <strong>Savea</strong> ✓</td><td>+3 pts</td></tr>
         <tr><td>First try scorer: picked <strong>Retallick</strong> ✗</td><td>0 pts</td></tr>
-        <tr><td>MOTM: picked <strong>Sam Cane</strong> ✓</td><td>+3 pts</td></tr>
       </table>
-      <div style="border-top:1px solid var(--border);margin-top:.5rem;padding-top:.5rem;text-align:right;font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:1.05rem;color:var(--accent3)">Total: 16 pts</div>
+      <div style="border-top:1px solid var(--border);margin-top:.5rem;padding-top:.5rem;text-align:right;font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:1.05rem;color:var(--accent3)">Total: 13 pts</div>
     </div>
   </div>
 
   <div class="htp-section">
     <h2>Results &amp; Leaderboard</h2>
-    <p>Results are fetched automatically from ESPN, usually within an hour of the final whistle. Try scorer and Man of the Match data follows shortly after — typically 30–60 minutes post-match as match reports are published.</p>
-    <p>Your group leaderboard only scores the prediction types your group has enabled. If your group doesn't have MOTM active, you won't see or score on it.</p>
+    <p>Results are fetched automatically from ESPN, usually within an hour of the final whistle. Try scorer data follows shortly after — typically 30–60 minutes post-match as the match summary is published.</p>
+    <p>Your group leaderboard only scores the prediction types your group has enabled.</p>
   </div>
 
   <div class="htp-section">
@@ -5595,7 +5245,6 @@ async def history_page(request: Request, t: str = "all"):
         dt = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%d %b %Y") if m["kickoff_ts"] else "—"
         mid = _esc(m["match_id"])
         league_name = ALL_ESPN_LEAGUES.get(m["tournament"] or "", (None, ""))[1] or m.get("tournament", "")
-        motm_tag = f'<span class="mr-motm">⭐ {_esc(m["res_motm"])}</span>' if m.get("res_motm") else ""
 
         # Build match breakdown for inline display
         try:
@@ -5635,11 +5284,6 @@ async def history_page(request: Request, t: str = "all"):
                                    f'<span class="mr-result-label">Try Scorers</span>'
                                    f'<span class="mr-result-val">{_esc(flat)}</span>'
                                    f'</div>')
-        if m.get("res_motm"):
-            breakdown_rows += (f'<div class="mr-result-row">'
-                               f'<span class="mr-result-label">Man of the Match</span>'
-                               f'<span class="mr-result-val">⭐ {_esc(m["res_motm"])}</span>'
-                               f'</div>')
 
         breakdown_html = (f'<div class="mr-result-block" style="border-top:none;padding-top:.5rem">'
                           f'<div class="mr-result-hdr">Match Breakdown</div>'
@@ -5659,7 +5303,7 @@ async def history_page(request: Request, t: str = "all"):
             f'<div class="hist-match-row" onclick="toggleHistMatch(this)">'
             f'<div class="hmr-main">'
             f'<span class="hmr-date">{dt}</span>'
-            f'<span class="hmr-title">{_esc(m["match_title"])}{motm_tag}</span>'
+            f'<span class="hmr-title">{_esc(m["match_title"])}</span>'
             f'<span class="hmr-score">{m["final_home"]}—{m["final_away"]}</span>'
             f'<span class="hmr-league">{_esc(league_name)}</span>'
             f'<span class="hmr-chevron material-symbols-outlined">expand_more</span>'
@@ -5961,7 +5605,6 @@ async def leaderboard(request: Request, t: str = "all"):
             has_margin = any(s["pts_margin"] for s in standings)
             has_btts   = any(s["pts_btts"] for s in standings)
             has_try    = any(s["pts_try"] for s in standings)
-            has_motm   = any(s["pts_motm"] for s in standings)
             has_banker = any(s["pts_banker"] for s in standings)
 
             simple_s = ""
@@ -5984,7 +5627,6 @@ async def leaderboard(request: Request, t: str = "all"):
                 if has_margin: opt_tds += f'<td class="lb-num">{s["pts_margin"] or 0}</td>'
                 if has_btts:   opt_tds += f'<td class="lb-num">{s["pts_btts"] or 0}</td>'
                 if has_try:    opt_tds += f'<td class="lb-num">{s["pts_try"] or 0}</td>'
-                if has_motm:   opt_tds += f'<td class="lb-num">{s["pts_motm"] or 0}</td>'
                 if has_banker: opt_tds += f'<td class="lb-num" style="color:var(--accent3)">+{s["pts_banker"] or 0}</td>'
                 detail_s += f"""<tr{you_cls}>
   <td class="lb-rank">{medal}</td>
@@ -6001,7 +5643,6 @@ async def leaderboard(request: Request, t: str = "all"):
             if has_margin: opt_hdr += '<th class="lb-num">Mrg</th>'
             if has_btts:   opt_hdr += '<th class="lb-num">BTS</th>'
             if has_try:    opt_hdr += '<th class="lb-num">Try</th>'
-            if has_motm:   opt_hdr += '<th class="lb-num">MOTM</th>'
             if has_banker: opt_hdr += '<th class="lb-num">🔒</th>'
             tid = f"lb-{t}"
             table_html = f"""<div style="display:flex;justify-content:flex-end;margin-bottom:.4rem">
@@ -6044,7 +5685,7 @@ async def leaderboard(request: Request, t: str = "all"):
         # 4. Recent results for this tournament
         async with _db.execute(
             """SELECT r.match_id, r.match_title, r.team_home, r.team_away, r.final_home, r.final_away,
-                      r.kickoff_ts, r.res_motm, COUNT(p.id) as pred_count
+                      r.kickoff_ts, COUNT(p.id) as pred_count
                FROM match_results r
                LEFT JOIN predictions p ON r.match_id = p.match_id
                WHERE r.tournament=?
@@ -6061,10 +5702,9 @@ async def leaderboard(request: Request, t: str = "all"):
                 dt = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%d %b %Y") if m["kickoff_ts"] else ""
                 mid = _esc(m["match_id"])
                 cnt = m["pred_count"]
-                motm_tag = f'<span class="mr-motm">⭐ {_esc(m["res_motm"])}</span>' if m.get("res_motm") else ""
                 m_rows += f"""<div class="match-result-row" data-mid="{mid}" onclick="togglePreds(this)">
   <span class="mr-date">{dt}</span>
-  <span class="mr-title">{_esc(m['match_title'])}{motm_tag}</span>
+  <span class="mr-title">{_esc(m['match_title'])}</span>
   <span class="mr-score">{m['final_home']}—{m['final_away']}</span>
   <span class="mr-cnt">{cnt} pick{"s" if cnt != 1 else ""}</span>
   <span class="mr-chevron material-symbols-outlined">chevron_right</span>
@@ -6214,7 +5854,7 @@ async function togglePreds(row){{
         +`<span class="mr-bd-pts">${{pts}}</span>`
         +'</div>';
     }});
-    if(d.result&&(d.result.winner||d.result.try_scorers?.length||d.result.motm)){{
+    if(d.result&&(d.result.winner||d.result.try_scorers?.length)){{
       const r=d.result;
       const winLabel=r.winner?r.winner.charAt(0).toUpperCase()+r.winner.slice(1):'—';
       const bttsLabel=r.btts!=null?(r.btts?'Yes':'No'):null;
@@ -6229,7 +5869,6 @@ async function togglePreds(row){{
       }}else if(r.try_scorers&&r.try_scorers.length){{
         html+=`<div class="mr-result-row"><span class="mr-result-label">Try Scorers</span><span class="mr-result-val">${{r.try_scorers.join(', ')}}</span></div>`;
       }}
-      if(r.motm)html+=`<div class="mr-result-row"><span class="mr-result-label">Man of the Match</span><span class="mr-result-val">⭐ ${{r.motm}}</span></div>`;
       html+='</div>';
     }}
     _predCache[mid]=html;
@@ -6275,13 +5914,6 @@ async def admin_page(request: Request):
         "SELECT * FROM match_results ORDER BY entered_at DESC LIMIT 20"
     ) as cur:
         resolved = [dict(r) for r in await cur.fetchall()]
-
-    # MOTM pending
-    async with _db.execute(
-        """SELECT match_id, match_title, team_home, team_away, tournament, entered_at, motm_scrape_debug
-           FROM match_results WHERE motm_pending=1 ORDER BY entered_at DESC"""
-    ) as cur:
-        motm_pending = [dict(r) for r in await cur.fetchall()]
 
     # Auto-fetch status
     laf = _last_auto_fetch
@@ -6362,19 +5994,10 @@ async def admin_page(request: Request):
     resolved_html = ""
     for r in resolved:
         t_name = ALL_ESPN_LEAGUES.get(r["tournament"], (None, r["tournament"]))[1] if r["tournament"] else r["tournament"]
-        motm_val = r.get("res_motm") or ""
-        debug_val = r.get("motm_scrape_debug") or ""
-        is_estimated = debug_val.startswith("estimated:") or debug_val.startswith("manual:")
-        motm_badge = ""
-        if motm_val:
-            est_tag = ' <span style="color:var(--accent3);font-size:.65rem">(est.)</span>' if is_estimated else ""
-            motm_badge = (f'<span style="font-size:.72rem;color:var(--muted);margin-left:.5rem">'
-                          f'{"~" if is_estimated else "✓"} MOTM: {_esc(motm_val)}{est_tag}'
-                          f'</span>')
         resolved_html += f"""<details class="pending-match">
   <summary>
     <span class="pm-title">{_esc(r['match_title'])}</span>
-    <span class="pm-meta">{_esc(t_name or '')}{motm_badge}</span>
+    <span class="pm-meta">{_esc(t_name or '')}</span>
     <span style="font-family:'Barlow Condensed',sans-serif;font-weight:700;color:var(--header)">{r['final_home']}–{r['final_away']}</span>
   </summary>
   <div class="result-form">
@@ -6389,7 +6012,6 @@ async def admin_page(request: Request):
       <div class="rf-row">
         <div class="rf-field"><label>{_esc(r['team_home'])}</label><input type="number" name="final_home" value="{r['final_home']}" min="0" max="200" required></div>
         <div class="rf-field"><label>{_esc(r['team_away'])}</label><input type="number" name="final_away" value="{r['final_away']}" min="0" max="200" required></div>
-        <div class="rf-field"><label>MOTM (optional)</label><input type="text" name="res_motm" value="{_esc(r.get('res_motm') or '')}"></div>
       </div>
       <button type="submit" class="btn btn-sm">Update Result</button>
     </form>
@@ -6400,27 +6022,6 @@ async def admin_page(request: Request):
 </details>"""
     if not resolved_html:
         resolved_html = '<div style="color:var(--muted);font-size:.85rem">No results entered yet.</div>'
-
-    # MOTM pending section
-    motm_html = ""
-    for m in motm_pending:
-        t_name = ALL_ESPN_LEAGUES.get(m["tournament"], (None, m["tournament"]))[1]
-        motm_html += f"""<div class="motm-row">
-  <div>
-    <div class="motm-title">{_esc(m['match_title'])}</div>
-    <div class="motm-meta">{_esc(t_name)}</div>
-    {f'<div style="font-size:.72rem;color:var(--accent3);margin-top:.2rem;word-break:break-all">🔍 {_esc(m["motm_scrape_debug"] or "no debug info")}</div>' if m.get("motm_scrape_debug") else ""}
-  </div>
-  <form method="post" action="/admin/motm/{_esc(m['match_id'])}" style="display:flex;gap:.5rem;align-items:center;flex-shrink:0">
-    <input type="text" name="motm" placeholder="Player name" required style="width:180px">
-    <button type="submit" class="btn btn-sm">Save MOTM</button>
-  </form>
-</div>"""
-    motm_section = f"""<div class="admin-section" style="border-color:rgba(245,166,35,.35)">
-  <div class="section-title" style="color:var(--accent3)">⚠ MOTM Pending ({len(motm_pending)} match{"es" if len(motm_pending)!=1 else ""})</div>
-  <div style="font-size:.8rem;color:var(--muted);margin-bottom:.75rem">Auto-scrape didn't find the result. Enter it manually below.</div>
-  {motm_html}
-</div>""" if motm_pending else ""
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -6444,13 +6045,9 @@ main{{max-width:780px;margin:2rem auto;padding:0 1.5rem;display:flex;flex-direct
 .rf-field{{display:flex;flex-direction:column;gap:.25rem;flex:1}}
 .rf-field label{{font-size:.75rem;color:var(--muted)}}
 .rf-field input,.rf-field select{{width:100%}}
-.motm-row{{display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.65rem .75rem;background:var(--surface2);border-radius:6px;margin-bottom:.4rem;flex-wrap:wrap}}
-.motm-title{{font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:.95rem}}
-.motm-meta{{font-size:.75rem;color:var(--muted)}}
 </style></head><body>
 {_nav(username, True, "admin")}
 <main>
-  {motm_section}
   <div class="admin-section">
     <div class="section-title">Users</div>
     {user_rows}
@@ -6620,7 +6217,6 @@ async def admin_enter_result(
     kickoff_ts: float = Form(default=0),
     final_home: int = Form(...),
     final_away: int = Form(...),
-    res_motm: str = Form(default=""),
 ):
     username, _ = await _require_admin(request)
     if not username:
@@ -6629,7 +6225,6 @@ async def admin_enter_result(
     winner = "home" if final_home > final_away else ("away" if final_away > final_home else "draw")
     margin = _calc_margin_band(abs(final_home - final_away))
     btts = 1 if final_home > 0 and final_away > 0 else 0
-    motm_val = res_motm.strip() or None
 
     # Preserve existing try scorer data if result already exists
     async with _db.execute(
@@ -6642,14 +6237,14 @@ async def admin_enter_result(
         """INSERT OR REPLACE INTO match_results
            (match_id,match_title,team_home,team_away,tournament,kickoff_ts,
             final_home,final_away,entered_by,entered_at,
-            res_winner,res_margin,res_btts,res_motm,
+            res_winner,res_margin,res_btts,
             res_try_scorers,res_first_try,motm_pending)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (match_id, match_title.strip(), team_home.strip(), team_away.strip(),
          tournament, kickoff_ts, final_home, final_away, username, time.time(),
-         winner, margin, btts, motm_val,
+         winner, margin, btts,
          existing.get("res_try_scorers"), existing.get("res_first_try"),
-         0 if motm_val else 1),
+         0),
     )
     await _db.commit()
 
@@ -6661,50 +6256,9 @@ async def admin_enter_result(
     for gid in group_ids:
         try:
             await _score_group(gid, match_id, tournament, final_home, final_away,
-                               winner, margin, btts, try_scorers, first_try, motm_val)
+                               winner, margin, btts, try_scorers, first_try)
         except Exception as exc:
             logger.warning("Score group %d error for %s: %s", gid, match_id, exc)
-
-    return RedirectResponse(url="/admin", status_code=303)
-
-
-@app.post("/admin/motm/{match_id}")
-async def admin_enter_motm(request: Request, match_id: str, motm: str = Form(...)):
-    """Standalone MOTM entry for matches where auto-scrape failed."""
-    username, _ = await _require_admin(request)
-    if not username:
-        return RedirectResponse(url="/", status_code=303)
-    motm = motm.strip()
-    if not motm:
-        return RedirectResponse(url="/admin", status_code=303)
-
-    async with _db.execute("SELECT * FROM match_results WHERE match_id=?", (match_id,)) as cur:
-        r = await cur.fetchone()
-    if not r:
-        return RedirectResponse(url="/admin", status_code=303)
-    r = dict(r)
-
-    await _db.execute(
-        "UPDATE match_results SET res_motm=?, motm_pending=0 WHERE match_id=?",
-        (motm, match_id),
-    )
-    await _db.commit()
-
-    try_scorers = json.loads(r.get("res_try_scorers") or "[]") or []
-    first_try = r.get("res_first_try")
-    winner = r["res_winner"]
-    margin = r["res_margin"]
-    btts = r["res_btts"]
-
-    async with _db.execute("SELECT id FROM groups") as cur:
-        group_ids = [r["id"] for r in await cur.fetchall()]
-    for gid in group_ids:
-        try:
-            await _score_group(gid, match_id, r["tournament"],
-                               r["final_home"], r["final_away"],
-                               winner, margin, btts, try_scorers, first_try, motm)
-        except Exception as exc:
-            logger.warning("MOTM re-score group %d: %s", gid, exc)
 
     return RedirectResponse(url="/admin", status_code=303)
 
@@ -6724,7 +6278,6 @@ async def admin_rescore_match(request: Request, match_id: str):
 
     try_scorers = json.loads(r.get("res_try_scorers") or "[]") or []
     first_try = r.get("res_first_try")
-    motm = r.get("res_motm")
     winner = r["res_winner"]
     margin = r["res_margin"]
     btts = r["res_btts"]
@@ -6735,7 +6288,7 @@ async def admin_rescore_match(request: Request, match_id: str):
         try:
             await _score_group(gid, match_id, r["tournament"],
                                r["final_home"], r["final_away"],
-                               winner, margin, btts, try_scorers, first_try, motm)
+                               winner, margin, btts, try_scorers, first_try)
         except Exception as exc:
             logger.warning("Rescore group %d for %s: %s", gid, match_id, exc)
 
