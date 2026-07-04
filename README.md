@@ -4,7 +4,7 @@
 
 <p align="center">
   A self-hosted rugby companion app with a prediction league built in.<br>
-  Live fixtures, match results, standings and squad data across 10 competitions —<br>
+  Live fixtures, match results, standings and squad data across 11 competitions —<br>
   plus a full prediction game to play with your mates.
 </p>
 
@@ -23,23 +23,23 @@
 ## Features
 
 ### As a rugby companion
-- Fixtures across 10 competitions — Super Rugby Pacific, URC, Six Nations, Rugby Championship, Premiership, Top 14, Champions Cup, Challenge Cup, World Cup, International
-- Full match breakdowns — try scorers grouped by team with minute stamps, first try scorer, Man of the Match
+- Fixtures across 11 competitions — Nations Championship, Super Rugby Pacific, URC, Six Nations, Rugby Championship, Premiership, Top 14, Champions Cup, Challenge Cup, World Cup, International
+- Full match breakdowns — try scorers grouped by team with minute stamps, first try scorer
 - League standings updated from ESPN
 - Pre-match squad data updated 48–72h before kickoff
 - Rugby news feed
 
 ### As a prediction league
-- 7 prediction types: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer, Man of the Match
+- 6 prediction types: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer
 - Banker pick — mark one prediction per week to double your points
 - Private groups with custom league subscriptions and prediction type sets
-- Full auto-resolution via ESPN + RSS scraping — no manual data entry for most matches
+- Fully auto-resolved from ESPN — no manual data entry, no API keys
 - Group leaderboards, personal accuracy stats, head-to-head, hot streak, shareable profile cards
 
 ### Self-hosted friendly
 - One `docker compose up --build -d` and it's running
 - No email server — password resets via admin-generated magic links (share on WhatsApp)
-- No API keys — uses ESPN (free) and public RSS feeds
+- No API keys — everything comes from ESPN's free public endpoints
 - All data stays on your server
 
 ---
@@ -89,10 +89,9 @@ Open `http://localhost:8888`. Log in, create a group, invite your mates.
 After the final whistle, Scrum:
 
 1. **Fetches the result from ESPN** and scores all groups immediately
-2. **Pulls try scorer data** from ESPN match summaries — each try has the scorer's name, team, and minute
-3. **Scrapes Man of the Match** from 4 public RSS feeds (RugbyPass, BBC Sport, The Roar, ESPN) using article pattern matching and player ratings extraction
+2. **Pulls try scorer data** from ESPN match summaries — each try has the scorer's name, team, and minute, so anytime and first-try-scorer predictions resolve automatically
 
-MOTM retries hourly for 48 hours. If it still can't find it, the admin enters it manually from the admin panel — one field, one button.
+Every prediction type is resolved from ESPN — there's nothing to enter by hand. The admin panel is there to correct a wrong result if you ever need to; it re-scores every group automatically.
 
 ---
 
@@ -136,7 +135,7 @@ location / {
 
 ## Competitions
 
-Super Rugby Pacific · URC · Six Nations · Rugby Championship · Premiership · Top 14 · Champions Cup · Challenge Cup · Rugby World Cup · International
+Nations Championship · Super Rugby Pacific · URC · Six Nations · Rugby Championship · Premiership · Top 14 · Champions Cup · Challenge Cup · Rugby World Cup · International
 
 Fixtures, results, standings and squad data pulled from ESPN. No API key required.
 
