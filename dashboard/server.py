@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 import aiosqlite
 import httpx
 import redis.asyncio as aioredis
-from bs4 import BeautifulSoup
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -5240,6 +5239,17 @@ async def history_page(request: Request, t: str = "all"):
         active_cls = " active" if slug == t else ""
         league_tabs += f'<a href="/history?t={_esc(slug)}" class="t-tab{active_cls}">{_esc(name)}</a>'
 
+    # Prediction counts for all shown matches in one query (avoids N+1 across the loop)
+    pred_counts: dict[str, int] = {}
+    if matches:
+        ids = [m["match_id"] for m in matches]
+        ph = ",".join("?" * len(ids))
+        async with _db.execute(
+            f"SELECT match_id, COUNT(*) as n FROM predictions WHERE match_id IN ({ph}) GROUP BY match_id",
+            ids,
+        ) as cur:
+            pred_counts = {r["match_id"]: r["n"] for r in await cur.fetchall()}
+
     rows_html = ""
     for m in matches:
         dt = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%d %b %Y") if m["kickoff_ts"] else "—"
@@ -5289,11 +5299,8 @@ async def history_page(request: Request, t: str = "all"):
                           f'<div class="mr-result-hdr">Match Breakdown</div>'
                           f'{breakdown_rows}</div>') if breakdown_rows else ""
 
-        # Prediction count for secondary section label
-        async with _db.execute(
-            "SELECT COUNT(*) as n FROM predictions WHERE match_id=?", (m["match_id"],)
-        ) as cur2:
-            cnt = (await cur2.fetchone())["n"]
+        # Prediction count for secondary section label (precomputed above)
+        cnt = pred_counts.get(m["match_id"], 0)
         preds_section = (f'<div class="hist-preds-toggle" onclick="event.stopPropagation();toggleHistPreds(this,\'{mid}\')">'
                          f'{cnt} prediction{"s" if cnt!=1 else ""} <span class="material-symbols-outlined" style="font-size:.85rem;vertical-align:middle">expand_more</span>'
                          f'</div>'
