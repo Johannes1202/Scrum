@@ -39,8 +39,13 @@ ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", os.environ.get("STREAM_PASSWO
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-AVATAR_DIR = "/data/avatars"
-os.makedirs(AVATAR_DIR, exist_ok=True)
+# Overridable so the module can be imported outside the container (tests, tooling).
+# Creation is best-effort for the same reason — the app only needs it to serve avatars.
+AVATAR_DIR = os.getenv("AVATAR_DIR", "/data/avatars")
+try:
+    os.makedirs(AVATAR_DIR, exist_ok=True)
+except OSError:
+    logger.warning("Could not create avatar dir %s", AVATAR_DIR)
 
 def _avatar_url(username: str) -> str | None:
     path = os.path.join(AVATAR_DIR, f"{username}.jpg")
@@ -60,6 +65,148 @@ ALL_ESPN_LEAGUES = {
     "champions-cup":      (271937, "European Champions Cup"),
     "challenge-cup":      (272073, "European Challenge Cup"),
 }
+
+# Derived leagues: trophy series ESPN has no league id for.
+#
+# ESPN delivers these under a generic source league (289234 "International") and
+# publishes no competition metadata to tell them apart — notes, type, series and
+# standings all come back null. So the split has to be declared here rather than
+# detected. Each entry claims events by exact team pairing plus a kickoff window;
+# the first match wins and anything unclaimed keeps its source league, which is why
+# International stays a real leftovers bucket (Japan, Fiji, Belgium, Paraguay).
+#
+# Windows are deliberately bounded to a single edition. When a series comes round
+# again the window must be extended, otherwise its fixtures fall back to the source
+# league — visibly wrong rather than silently misfiled. _derived_windows_expired()
+# surfaces that; the test suite asserts on it.
+DERIVED_LEAGUES = [
+    {
+        "slug": "greatest-rivalry", "name": "Rugby's Greatest Rivalry",
+        "source": 289234, "teams": {"south africa", "new zealand"},
+        "from": "2026-08-01", "to": "2026-09-30",
+    },
+    {
+        "slug": "puma-trophy", "name": "Puma Trophy",
+        "source": 289234, "teams": {"argentina", "australia"},
+        "from": "2026-08-01", "to": "2026-09-30",
+    },
+    {
+        "slug": "mandela-plate", "name": "Mandela Challenge Plate",
+        "source": 289234, "teams": {"australia", "south africa"},
+        "from": "2026-09-01", "to": "2026-10-01",
+    },
+    {
+        "slug": "bledisloe-cup", "name": "Bledisloe Cup",
+        "source": 289234, "teams": {"new zealand", "australia"},
+        "from": "2026-10-01", "to": "2026-10-31",
+    },
+]
+
+for _d in DERIVED_LEAGUES:
+    _d["from_ts"] = datetime.strptime(_d["from"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    _d["to_ts"]   = datetime.strptime(_d["to"],   "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    # Registered as first-class leagues so name lookups, group subscriptions and the
+    # Global auto-follow on startup all treat them like any other competition.
+    ALL_ESPN_LEAGUES[_d["slug"]] = (_d["source"], _d["name"])
+
+DERIVED_BY_SLUG = {d["slug"]: d for d in DERIVED_LEAGUES}
+
+# Northern-hemisphere club competitions run Sep->Jun, so their season straddles two
+# calendar years and is labelled "2026-27". Everything else (southern hemisphere club
+# rugby, internationals, tours, one-off trophy series) fits inside a calendar year.
+# Without this, next season's URC would pile onto this season's under the same slug.
+SPLIT_SEASON_LEAGUES = {"urc", "premiership", "top-14", "champions-cup", "challenge-cup"}
+
+# How many fixtures per competition survive past the fortnight window on the Predict
+# page. Eight covers a full tour (four Tests plus four midweek games) end to end,
+# without Top 14's 71 upcoming fixtures burying everything else.
+UPCOMING_PER_LEAGUE = 8
+
+# Fixtures ESPN does not carry at all.
+#
+# Rugby's Greatest Rivalry is eight matches — four Tests plus four midweek games
+# against the SA URC provinces — but ESPN only publishes the Tests. All 25 of its
+# rugby leagues were checked; the provincial games appear in none of them. Declared
+# here so they are predictable like anything else.
+#
+# match_id is a namespaced slug rather than a number, so it can never collide with an
+# ESPN event id. There is no espn_id, which means squad pre-fetch and try-scorer
+# auto-resolution skip these by design — results are entered from Admin.
+#
+# Times are UTC. SAST is UTC+2, so a 19:10 local kick-off is 17:10 here; verified
+# against sarugbymag.co.za and cross-checked with ESPN's Test times, which match.
+MANUAL_FIXTURES = [
+    {"match_id": "gr2026-stormers", "tournament": "greatest-rivalry",
+     "team_home": "Stormers", "team_away": "New Zealand",
+     "kickoff": "2026-08-07T17:10:00Z", "venue": "Cape Town Stadium"},
+    {"match_id": "gr2026-sharks", "tournament": "greatest-rivalry",
+     "team_home": "Sharks", "team_away": "New Zealand",
+     "kickoff": "2026-08-11T17:10:00Z", "venue": "Kings Park, Durban"},
+    {"match_id": "gr2026-bulls", "tournament": "greatest-rivalry",
+     "team_home": "Bulls", "team_away": "New Zealand",
+     "kickoff": "2026-08-15T17:10:00Z", "venue": "Loftus Versfeld, Pretoria"},
+    {"match_id": "gr2026-lions", "tournament": "greatest-rivalry",
+     "team_home": "Lions", "team_away": "New Zealand",
+     "kickoff": "2026-08-25T17:10:00Z", "venue": "Ellis Park, Johannesburg"},
+]
+
+
+def _fixture_key(m: dict) -> tuple:
+    """Identity of a fixture independent of who supplied it: the two sides and the day.
+
+    Matched on this rather than on id because a manual fixture's slug will never equal
+    the numeric id ESPN would assign. If ESPN starts carrying one of these games, the
+    real event has to win — otherwise the fixture would appear twice.
+    """
+    sides = tuple(sorted((_norm_name(m.get("team_home", "")), _norm_name(m.get("team_away", "")))))
+    day = int((m.get("kickoff_ts") or 0) // 86400)
+    return sides + (day,)
+
+
+def _with_manual_fixtures(matches: list[dict]) -> list[dict]:
+    """Merge declared fixtures into an ESPN feed, letting real ESPN events take priority."""
+    have = {_fixture_key(m) for m in matches}
+    extra = []
+    for r in _manual_fixture_rows():
+        if _fixture_key(r) in have:
+            logger.info("Manual fixture %s superseded by ESPN", r["slug"])
+            continue
+        extra.append(r)
+    merged = list(matches) + extra
+    merged.sort(key=lambda x: x.get("kickoff_ts") or 0)
+    return merged
+
+
+def _manual_fixture_rows() -> list[dict]:
+    """MANUAL_FIXTURES shaped like the ESPN upcoming feed, so callers cannot tell them apart."""
+    rows = []
+    for f in MANUAL_FIXTURES:
+        kts = _iso_to_ts(f["kickoff"])
+        rows.append({
+            "tournament": f["tournament"],
+            "tournament_name": ALL_ESPN_LEAGUES.get(f["tournament"], (None, f["tournament"]))[1],
+            "espn_id": "",              # no ESPN event — skips squad pre-fetch and auto-resolve
+            "slug": f["match_id"],
+            "league_id": None,
+            "team_home": f["team_home"],
+            "team_away": f["team_away"],
+            "kickoff_ts": kts,
+            "in_progress": False,
+            "manual": True,
+            "venue": f.get("venue", ""),
+        })
+    return rows
+
+
+def _season_for(tournament: str, kickoff_ts: float) -> str:
+    """Season label a match belongs to, e.g. '2026-27' for URC or '2026' for a tour."""
+    if not kickoff_ts:
+        return ""
+    d = datetime.fromtimestamp(kickoff_ts, timezone.utc)
+    if tournament in SPLIT_SEASON_LEAGUES:
+        start = d.year if d.month >= 7 else d.year - 1
+        return f"{start}-{str(start + 1)[2:]}"
+    return str(d.year)
 
 TOURNAMENTS  = {k: v[1] for k, v in ALL_ESPN_LEAGUES.items()}
 ESPN_LEAGUES = {k: v[0] for k, v in ALL_ESPN_LEAGUES.items()}
@@ -310,6 +457,20 @@ async def _init_db():
             await _db.commit()
         except Exception:
             pass
+    # Season tracking. leaderboard carries kickoff_ts so every aggregation can be
+    # scoped to a season without joining match_results, and so "most recent" means
+    # most recently played rather than most recently rescored.
+    for tbl, col in (("match_results", "season TEXT"),
+                     ("predictions",   "season TEXT"),
+                     ("leaderboard",   "season TEXT"),
+                     ("leaderboard",   "kickoff_ts REAL"),
+                     ("groups",        "season_start_ts REAL NOT NULL DEFAULT 0")):
+        try:
+            await _db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
+            await _db.commit()
+        except Exception:
+            pass
+
     try:
         await _db.execute("ALTER TABLE leaderboard ADD COLUMN group_id INTEGER NOT NULL DEFAULT 1")
         await _db.commit()
@@ -331,6 +492,29 @@ async def _init_db():
             await _db.commit()
         except Exception:
             pass
+
+    # Backfill season labels and leaderboard kickoffs for rows written before the
+    # season columns existed. Idempotent — only touches rows still missing a value.
+    try:
+        await _db.execute(
+            """UPDATE leaderboard SET kickoff_ts = (
+                   SELECT r.kickoff_ts FROM match_results r WHERE r.match_id = leaderboard.match_id)
+                WHERE kickoff_ts IS NULL""")
+        for tbl in ("match_results", "predictions", "leaderboard"):
+            # Alias the rowid: tables with an INTEGER PRIMARY KEY (predictions,
+            # leaderboard) return it under that column's name instead of "rowid".
+            async with _db.execute(
+                f"SELECT rowid AS rid, tournament, kickoff_ts FROM {tbl} "
+                f"WHERE (season IS NULL OR season='') AND kickoff_ts IS NOT NULL") as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await _db.execute(f"UPDATE {tbl} SET season=? WHERE rowid=?",
+                                  (_season_for(r["tournament"] or "", r["kickoff_ts"]), r["rid"]))
+            if rows:
+                logger.info("Season backfill: %s rows in %s", len(rows), tbl)
+        await _db.commit()
+    except Exception as exc:
+        logger.warning("Season backfill skipped: %s", exc)
 
     for ddl in [
         "CREATE TABLE IF NOT EXISTS custom_competitions (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL REFERENCES groups(id), name TEXT NOT NULL, slug TEXT NOT NULL, created_at REAL NOT NULL, UNIQUE(group_id, slug))",
@@ -382,18 +566,15 @@ async def _init_db():
             )
             await _db.commit()
 
-    # Add all existing users to Global group if not already members
-    async with _db.execute("SELECT username FROM users") as cur:
-        all_users = [r["username"] for r in await cur.fetchall()]
-    for u in all_users:
-        try:
-            role = "admin" if u == admin else "member"
-            await _db.execute(
-                "INSERT OR IGNORE INTO group_members (group_id,username,role,joined_at) VALUES(1,?,?,?)",
-                (u, role, time.time()),
-            )
-        except Exception:
-            pass
+    # Global is opt-in: players choose whether to compete server-wide, so nobody is
+    # enrolled automatically. Only the admin is seeded, to keep the group owned.
+    try:
+        await _db.execute(
+            "INSERT OR IGNORE INTO group_members (group_id,username,role,joined_at) VALUES(1,?,?,?)",
+            (admin, "admin", time.time()),
+        )
+    except Exception:
+        pass
     await _db.commit()
 
     # Global group: follow all leagues by default
@@ -458,13 +639,43 @@ def _names_match(a: str, b: str) -> bool:
     return bool(wa and wb and wa & wb)
 
 
+def _derive_tournament(league_id: int, team_home: str, team_away: str, kickoff_ts: float,
+                       slug: str, league_name: str) -> tuple[str, str]:
+    """Reassign an event to a derived league if it matches one, else leave it alone.
+
+    Matching is on the exact pair of teams, so a third nation playing either side is
+    never swept in. Returns (slug, display_name) for whichever league owns the event.
+    """
+    if not kickoff_ts:
+        return slug, league_name
+    pair = {_norm_name(team_home), _norm_name(team_away)}
+    for d in DERIVED_LEAGUES:
+        if d["source"] != league_id or pair != d["teams"]:
+            continue
+        if d["from_ts"] <= kickoff_ts < d["to_ts"]:
+            return d["slug"], d["name"]
+    return slug, league_name
+
+
+def _derived_windows_expired(now: float | None = None) -> list[str]:
+    """Derived leagues whose window has fully elapsed — their config needs a new edition.
+
+    Left unattended these stop claiming fixtures and the series quietly reverts to
+    appearing as generic International matches.
+    """
+    now = time.time() if now is None else now
+    return [d["slug"] for d in DERIVED_LEAGUES if d["to_ts"] <= now]
+
+
 async def _fetch_espn_results(days_back: int = 45) -> list[dict]:
     """Fetch completed results from ESPN for all known leagues."""
     results = []
     end = datetime.now(timezone.utc) + timedelta(days=1)  # +1: ESPN end date is exclusive
     start = end - timedelta(days=days_back + 1)
     date_range = f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
-    for slug, (league_id, _) in ALL_ESPN_LEAGUES.items():
+    for slug, (league_id, league_name) in ALL_ESPN_LEAGUES.items():
+        if slug in DERIVED_BY_SLUG:
+            continue  # filled from their source league by _derive_tournament
         url = (f"https://site.api.espn.com/apis/site/v2/sports/rugby"
                f"/{league_id}/scoreboard?limit=100&dates={date_range}")
         try:
@@ -486,8 +697,12 @@ async def _fetch_espn_results(days_back: int = 45) -> list[dict]:
                     score_away = int(away.get("score", 0))
                 except (ValueError, TypeError):
                     continue
+                event_ts = _iso_to_ts(event.get("date", ""))
+                ev_slug, _ev_name = _derive_tournament(
+                    league_id, home["team"]["displayName"], away["team"]["displayName"],
+                    event_ts, slug, league_name)
                 results.append({
-                    "tournament":  slug,
+                    "tournament":  ev_slug,
                     "league_id":   league_id,
                     "espn_id":     event.get("id", ""),
                     "team_home":   home["team"]["displayName"],
@@ -549,7 +764,17 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
     if not preds:
         return
 
-    try_set = set(_scorer_names(res_try_scorers or []))
+    # Stamp the season on every row so leaderboards can be scoped to one without
+    # joining match_results, and so next season's fixtures never pile onto this one.
+    async with _db.execute(
+        "SELECT kickoff_ts FROM match_results WHERE match_id=?", (match_id,)
+    ) as cur:
+        kt_row = await cur.fetchone()
+    match_kickoff = kt_row["kickoff_ts"] if kt_row else None
+    season = _season_for(tournament, match_kickoff or 0)
+
+    try_set = {_norm_player(n) for n in _scorer_names(res_try_scorers or [])}
+    first_try_norm = _norm_player(res_first_try)
 
     for p in preds:
         p["diff"] = abs(p["score_home"] - fh) + abs(p["score_away"] - fa)
@@ -571,10 +796,10 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
             except (ValueError, TypeError):
                 pass
         if "try_anytime" in pred_types and p["pred_try_any"] and try_set:
-            if p["pred_try_any"] in try_set:
+            if _norm_player(p["pred_try_any"]) in try_set:
                 pta = 3
         if "try_first" in pred_types and p["pred_try_first"] and res_first_try:
-            if p["pred_try_first"] == res_first_try:
+            if _norm_player(p["pred_try_first"]) == first_try_norm:
                 ptf = 4
 
         pts = ps + pw + pm + pb + pta + ptf + pmo
@@ -588,19 +813,91 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
             """INSERT OR REPLACE INTO leaderboard
                (group_id,match_id,tournament,username,diff,exact_score,points,
                 pts_score,pts_winner,pts_margin,pts_btts,pts_try_any,pts_try_first,pts_motm,pts_banker,
-                created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at,season,kickoff_ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (group_id, match_id, tournament, p["username"],
              p["diff"], exact, pts,
              ps, pw, pm, pb, pta, ptf, pmo, banker_bonus,
-             time.time()),
+             time.time(), season, match_kickoff),
         )
     await _db.commit()
+
+
+BANKER_WEEK = 604800
+
+
+def _banker_week_start(ts: float) -> float:
+    """Start of the 7-day bucket a kickoff falls in.
+
+    Buckets run from Thursday 00:00 UTC (the epoch's own weekday), which keeps a
+    Fri-Sun round of fixtures together in one bucket.
+    """
+    return ts - (ts % BANKER_WEEK)
+
+
+async def _backfill_member(group_id: int, username: str) -> int:
+    """Score a new member's already-resolved predictions for this group.
+
+    _score_group only ever scores members present at scoring time, so without this a
+    player joining part-way through arrives with a blank record — even though their
+    predictions were made and resolved long before. Returns matches backfilled.
+
+    Rescoring is idempotent, but note it recomputes the closest-prediction bonus over
+    the group's current members: if the new arrival was nearer than whoever previously
+    held it, that 3-point bonus legitimately moves. Nothing else about existing rows
+    changes.
+    """
+    async with _db.execute(
+        """SELECT r.match_id, r.tournament, r.final_home, r.final_away,
+                  r.res_winner, r.res_margin, r.res_btts,
+                  r.res_try_scorers, r.res_first_try
+             FROM predictions p
+             JOIN match_results r ON r.match_id = p.match_id
+             JOIN group_leagues gl ON gl.group_id = ? AND gl.league_slug = p.tournament
+            WHERE p.username = ?
+              AND r.final_home IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM leaderboard l
+                               WHERE l.group_id = ? AND l.match_id = r.match_id
+                                 AND l.username = p.username)""",
+        (group_id, username, group_id),
+    ) as cur:
+        matches = [dict(r) for r in await cur.fetchall()]
+
+    done = 0
+    for m in matches:
+        try:
+            scorers = json.loads(m.get("res_try_scorers") or "[]") or []
+        except Exception:
+            scorers = []
+        try:
+            await _score_group(group_id, m["match_id"], m["tournament"],
+                               m["final_home"], m["final_away"],
+                               m["res_winner"], m["res_margin"], m["res_btts"],
+                               scorers, m["res_first_try"])
+            done += 1
+        except Exception as exc:
+            logger.warning("Backfill error: group %d match %s for %s: %s",
+                           group_id, m["match_id"], username, exc)
+    if done:
+        logger.info("Backfilled %d resolved matches for %s in group %d", done, username, group_id)
+    return done
 
 
 def _scorer_names(scorers: list) -> list[str]:
     """Extract flat name list from either old format (list[str]) or new format (list[dict])."""
     return [s["name"] if isinstance(s, dict) else s for s in (scorers or [])]
+
+
+def _norm_player(name: str | None) -> str:
+    """Player name reduced to a comparable form.
+
+    Try-scorer points are awarded by matching the pick against the result, and sources
+    disagree on capitalisation and spacing — allblacks.com prints "Ethan De Groot"
+    where ESPN has "Ethan de Groot". Comparing raw strings silently awarded nothing
+    for a correct pick, which is the same class of quiet failure as the May 2026
+    type-coercion bugs.
+    """
+    return " ".join((name or "").split()).casefold()
 
 
 async def _fetch_try_scorers(espn_id: str, league_id: int) -> tuple[list[dict], str | None]:
@@ -700,13 +997,14 @@ async def _auto_apply_results() -> tuple[int, int]:
                     """INSERT OR IGNORE INTO match_results
                        (match_id,match_title,team_home,team_away,tournament,kickoff_ts,
                         final_home,final_away,entered_by,entered_at,
-                        res_winner,res_margin,res_btts)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        res_winner,res_margin,res_btts,season)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (pred["match_id"], pred["match_title"],
                      pred["team_home"], pred["team_away"],
                      tourn, pred["kickoff_ts"],
                      fh, fa, "auto-fetch", time.time(),
-                     winner, margin, btts),
+                     winner, margin, btts,
+                     _season_for(tourn, pred["kickoff_ts"])),
                 )
                 await _db.commit()
 
@@ -753,14 +1051,15 @@ async def _auto_apply_results() -> tuple[int, int]:
             await _db.execute(
                 """INSERT OR IGNORE INTO match_results
                    (match_id,match_title,team_home,team_away,tournament,kickoff_ts,
-                    final_home,final_away,entered_by,entered_at,res_winner,res_margin,res_btts)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    final_home,final_away,entered_by,entered_at,res_winner,res_margin,res_btts,season)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (slug,
                  f"{espn_match['team_home']} vs {espn_match['team_away']}",
                  espn_match["team_home"], espn_match["team_away"],
                  espn_match["tournament"], espn_match.get("event_ts", 0),
                  fh, fa, "espn-companion", time.time(),
-                 winner, margin, btts),
+                 winner, margin, btts,
+                 _season_for(espn_match["tournament"], espn_match.get("event_ts", 0))),
             )
             await _db.commit()
             # Queue try scorer fetch in background
@@ -822,14 +1121,21 @@ async def _resolve_and_rescore(match_id: str, tournament: str,
                 match_id, try_scorers, first_try)
 
 
-async def _harvest_players(match_id: str, league_id: int) -> None:
-    """Fetch ESPN match summary and store player rosters in the players table."""
+async def _harvest_players(match_id: str, league_id: int) -> int:
+    """Fetch ESPN match summary and store player rosters. Returns players stored.
+
+    ESPN returns the roster containers well before it fills them, so a 200 with zero
+    players is normal this far out and is NOT a failure. The count is returned (and
+    logged) because a bare "harvested" line previously hid empty results, which is how
+    the May 2026 cache-poisoning bug went unnoticed.
+    """
     url = (f"https://site.api.espn.com/apis/site/v2/sports/rugby"
            f"/{league_id}/summary?event={match_id}")
+    stored = 0
     try:
         resp = await _http_client.get(url, timeout=12)
         if resp.status_code != 200:
-            return
+            return 0
         data = resp.json()
         rosters = data.get("rosters", [])
         for team_entry in rosters:
@@ -854,10 +1160,68 @@ async def _harvest_players(match_id: str, league_id: int) -> None:
                          last_seen_ts=excluded.last_seen_ts, last_seen_match=excluded.last_seen_match""",
                     (name, team_name, jersey_int, position, time.time(), match_id),
                 )
+                stored += 1
         await _db.commit()
-        logger.info("Harvested players for match %s", match_id)
+        if stored:
+            logger.info("Harvested %d players for match %s", stored, match_id)
+        else:
+            logger.info("No squad published yet for match %s (%d roster slots empty) "
+                        "— will retry", match_id, len(rosters))
     except Exception as exc:
         logger.warning("Player harvest error for match %s: %s", match_id, exc)
+    return stored
+
+
+async def _seed_missing_squads() -> int:
+    """Give every team in an upcoming fixture a squad, harvesting from a past match.
+
+    The try-scorer dropdowns read the players table by team name, and squads normally
+    arrive with the pre-match roster fetch. That never happens for a team ESPN has no
+    upcoming event for — the tour's provincial opponents are declared manually and
+    carry no ESPN id at all, so the Sharks had an empty dropdown while their opponents
+    did not. Backfilling from any recent appearance fixes that, and self-heals for any
+    future team that turns up cold. Returns teams seeded.
+    """
+    try:
+        upcoming = await _fetch_espn_upcoming()
+    except Exception as exc:
+        logger.warning("Seed squads: upcoming fetch failed: %s", exc)
+        return 0
+
+    wanted = {t for m in upcoming for t in (m.get("team_home"), m.get("team_away")) if t}
+    missing = set()
+    for team in wanted:
+        async with _db.execute(
+            "SELECT 1 FROM players WHERE team_name=? LIMIT 1", (team,)
+        ) as cur:
+            if not await cur.fetchone():
+                missing.add(team)
+    if not missing:
+        return 0
+
+    logger.info("Seed squads: %d team(s) with no players: %s", len(missing), sorted(missing))
+    try:
+        past = await _fetch_espn_results(days_back=150)
+    except Exception as exc:
+        logger.warning("Seed squads: results fetch failed: %s", exc)
+        return 0
+
+    # Most recent appearance first, so the squad we store is the freshest available.
+    past.sort(key=lambda r: r.get("event_ts") or 0, reverse=True)
+    seeded = 0
+    for team in sorted(missing):
+        for r in past:
+            if team not in (r.get("team_home"), r.get("team_away")):
+                continue
+            if not r.get("espn_id") or not r.get("league_id"):
+                continue
+            stored = await _harvest_players(r["espn_id"], r["league_id"])
+            if stored:
+                logger.info("Seed squads: %s seeded from event %s (%d players)",
+                            team, r["espn_id"], stored)
+                seeded += 1
+                break
+    return seeded
 
 
 _pre_fetched_squads: set[str] = set()
@@ -886,9 +1250,14 @@ async def _pre_fetch_squads() -> None:
             if row and row[0] > 0:
                 continue
             _pre_fetched_squads.discard(espn_id)
-        await _harvest_players(espn_id, league_id)
-        _pre_fetched_squads.add(espn_id)
-        logger.info("Pre-fetched squad for ESPN event %s (%s vs %s)", espn_id, m["team_home"], m["team_away"])
+        stored = await _harvest_players(espn_id, league_id)
+        # Only mark it done once ESPN actually gave us players, otherwise the next
+        # hourly pass re-tries. Internationals routinely publish under 24h out, well
+        # after the 48h prediction window opens.
+        if stored:
+            _pre_fetched_squads.add(espn_id)
+            logger.info("Pre-fetched squad for ESPN event %s (%s vs %s): %d players",
+                        espn_id, m["team_home"], m["team_away"], stored)
 
 
 async def _auto_fetch_loop():
@@ -901,17 +1270,22 @@ async def _auto_fetch_loop():
             if applied:
                 logger.info("Auto-fetch: applied %d/%d results", applied, checked)
             await _pre_fetch_squads()
+            await _seed_missing_squads()
         except Exception as exc:
             logger.warning("Auto-fetch loop error: %s", exc)
         await asyncio.sleep(3600)  # every hour
 
 
 async def _fetch_espn_upcoming() -> list[dict]:
-    """Fetch upcoming matches from ESPN for all known leagues. Cached 2h in Redis."""
+    """Fetch upcoming matches from ESPN for all known leagues. Cached 2h in Redis.
+
+    Manually declared fixtures are merged in after the cache, not before it, so editing
+    MANUAL_FIXTURES takes effect on the next request instead of waiting out the TTL.
+    """
     cached = await _redis.get("espn:upcoming")
     if cached:
         try:
-            return json.loads(cached)
+            return _with_manual_fixtures(json.loads(cached))
         except Exception:
             pass
     matches = []
@@ -919,6 +1293,8 @@ async def _fetch_espn_upcoming() -> list[dict]:
     end = start + timedelta(days=120)
     date_range = f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
     for slug, (league_id, league_name) in ALL_ESPN_LEAGUES.items():
+        if slug in DERIVED_BY_SLUG:
+            continue  # filled from their source league by _derive_tournament
         url = (f"https://site.api.espn.com/apis/site/v2/sports/rugby"
                f"/{league_id}/scoreboard?limit=100&dates={date_range}")
         try:
@@ -936,9 +1312,12 @@ async def _fetch_espn_upcoming() -> list[dict]:
                 home = next((t for t in teams if t.get("homeAway") == "home"), teams[0])
                 away = next((t for t in teams if t.get("homeAway") == "away"), teams[1])
                 kickoff_ts = _iso_to_ts(event.get("date", ""))
+                ev_slug, ev_name = _derive_tournament(
+                    league_id, home["team"]["displayName"], away["team"]["displayName"],
+                    kickoff_ts, slug, league_name)
                 matches.append({
-                    "tournament": slug,
-                    "tournament_name": league_name,
+                    "tournament": ev_slug,
+                    "tournament_name": ev_name,
                     "espn_id": event.get("id", ""),
                     "slug": event.get("id", ""),
                     "league_id": league_id,
@@ -951,7 +1330,7 @@ async def _fetch_espn_upcoming() -> list[dict]:
             logger.warning("ESPN upcoming fetch error for %s: %s", slug, exc)
     matches.sort(key=lambda x: x["kickoff_ts"])
     await _redis.setex("espn:upcoming", 7200, json.dumps(matches))
-    return matches
+    return _with_manual_fixtures(matches)
 
 
 async def _fetch_espn_live() -> list[dict]:
@@ -964,6 +1343,8 @@ async def _fetch_espn_live() -> list[dict]:
             pass
     live = []
     for slug, (league_id, league_name) in ALL_ESPN_LEAGUES.items():
+        if slug in DERIVED_BY_SLUG:
+            continue  # filled from their source league by _derive_tournament
         url = f"https://site.api.espn.com/apis/site/v2/sports/rugby/{league_id}/scoreboard"
         try:
             resp = await _http_client.get(url, timeout=8)
@@ -979,8 +1360,11 @@ async def _fetch_espn_live() -> list[dict]:
                     continue
                 home = next((t for t in teams if t.get("homeAway") == "home"), teams[0])
                 away = next((t for t in teams if t.get("homeAway") == "away"), teams[1])
+                _ev_slug, ev_name = _derive_tournament(
+                    league_id, home["team"]["displayName"], away["team"]["displayName"],
+                    _iso_to_ts(event.get("date", "")), slug, league_name)
                 live.append({
-                    "tournament":  league_name,
+                    "tournament":  ev_name,
                     "team_home":   home["team"]["displayName"],
                     "team_away":   away["team"]["displayName"],
                     "score_home":  home.get("score", ""),
@@ -1150,13 +1534,16 @@ _BASE_CSS = """:root{--bg:#f2f7f3;--surface:#ffffff;--surface2:#e8f2ea;--accent:
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Barlow',sans-serif;min-height:100vh}
 a{color:inherit;text-decoration:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .nav-wordmark{height:28px;width:auto;display:block}
 header{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 2rem;height:64px;border-bottom:2px solid rgba(0,0,0,.12);background:var(--header);position:sticky;top:0;z-index:10}
 .nav-left{display:flex;align-items:center}
 .nav-center{display:flex;align-items:center;gap:2.5rem}
 .nav-right{display:flex;align-items:center;justify-content:flex-end;gap:1.25rem}
-.nav-link{font-family:'Barlow Condensed',sans-serif;font-size:.9rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.65);padding:.18rem 0;border-bottom:2px solid transparent;transition:color .2s,border-color .2s}
+/* Vertical padding gives a 44px touch height without changing how the header looks —
+   Admin and Logout were 20px tall, well under the minimum for a thumb. */
+.nav-link{font-family:'Barlow Condensed',sans-serif;font-size:.9rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.65);padding:.7rem 0;border-bottom:2px solid transparent;transition:color .2s,border-color .2s;display:inline-flex;align-items:center;min-height:44px}
 .nav-link:hover{color:#fff;border-color:rgba(255,255,255,.5)}
 .nav-link.active{color:var(--accent3);border-color:var(--accent3)}
 .admin-link{font-size:.75rem;opacity:.5;letter-spacing:.05em;border-bottom:none}
@@ -1174,7 +1561,8 @@ input:focus,select:focus{border-color:var(--header)}
 .tag{font-family:'Barlow Condensed',sans-serif;font-size:.68rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:.15rem .45rem;border-radius:4px}
 .material-symbols-outlined{font-size:1.1rem;vertical-align:middle;font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24}
 .bnav{display:none;position:fixed;bottom:0;left:0;right:0;height:58px;background:#fff;border-top:1.5px solid var(--border);z-index:20;justify-content:space-around;align-items:center;box-shadow:0 -2px 12px rgba(0,0,0,.06)}
-.bnav-item{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;color:var(--muted);font-family:'Barlow Condensed',sans-serif;font-size:.62rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:.5rem 0;transition:color .2s;text-decoration:none}
+/* .62rem rendered at 9.9px, below the ~12px floor for comfortable reading on a phone. */
+.bnav-item{display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;color:var(--muted);font-family:'Barlow Condensed',sans-serif;font-size:.75rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:.5rem 0;transition:color .2s;text-decoration:none}
 .bnav-item:hover,.bnav-item.active{color:var(--header)}
 .bnav-item.active span:not(.bnav-badge){color:var(--accent3)}
 .bnav-icon{width:24px;height:24px;object-fit:contain;filter:brightness(0) saturate(100%) invert(42%) sepia(15%) saturate(600%) hue-rotate(95deg) brightness(85%);transition:filter .2s}
@@ -1210,11 +1598,24 @@ input:focus,select:focus{border-color:var(--header)}
 """
 
 
+# Every page needs exactly one h1 for screen readers and for search engines to make
+# sense of a public portfolio piece. The design has no visible page title — the
+# wordmark sits in the header — so these are visually hidden rather than drawn.
+_PAGE_H1 = {
+    "me": "Your profile", "groups": "Your groups",
+    "leaderboard": "Fixtures and predictions", "standings": "Standings",
+    "history": "Results", "news": "Rugby news", "how-to-play": "How to play",
+    "admin": "Administration",
+}
+
+
 def _nav(username: str, is_admin: bool, active: str = "") -> str:
     def _ac(name):
         return " active" if active == name else ""
     adm = f'<a href="/admin" class="nav-link admin-link{_ac("admin")}">Admin</a>' if is_admin else ""
-    return f"""<header>
+    heading = _PAGE_H1.get(active, "Scrum")
+    return f"""<h1 class="sr-only">{heading}</h1>
+<header>
   <div class="nav-left"><a href="/"><img src="/static/wordmark.png" alt="Scrum" class="nav-wordmark"></a></div>
   <div class="nav-center">
     <a href="/me" class="nav-link{_ac('me')}">Me</a>
@@ -1591,6 +1992,136 @@ async def _all_group_custom_matches(group_id: int) -> dict[str, int]:
         return {r["match_id"]: r["comp_id"] for r in await cur.fetchall()}
 
 
+# ── Profile aggregation ───────────────────────────────────────────────────────
+# Everything on a player's profile is built from the groups they actually compete
+# in. Global is one of those groups only if they opted into it, so a player who
+# wants nothing to do with the server-wide league never sees it in their numbers.
+#
+# Deduped per match: one prediction can score in several groups at once, and
+# summing them would inflate a profile purely for joining more leagues. The best
+# return on each prediction is counted once.
+
+GLOBAL_GROUP_ID = 1
+
+
+async def _in_global(username: str) -> bool:
+    async with _db.execute(
+        "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+        (GLOBAL_GROUP_ID, username),
+    ) as cur:
+        return await cur.fetchone() is not None
+
+
+async def _profile_totals(username: str) -> dict:
+    """Points, matches and exact scores across the player's groups, deduped per match."""
+    async with _db.execute(
+        """SELECT COUNT(*) AS matches,
+                  COALESCE(SUM(pts),0) AS total_pts,
+                  COALESCE(SUM(ex),0)  AS exact_count
+             FROM (SELECT l.match_id,
+                          MAX(l.points)      AS pts,
+                          MAX(l.exact_score) AS ex
+                     FROM leaderboard l
+                     JOIN group_members gm
+                       ON gm.group_id = l.group_id AND gm.username = l.username
+                    WHERE l.username = ?
+                    GROUP BY l.match_id)""",
+        (username,),
+    ) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else {"matches": 0, "total_pts": 0, "exact_count": 0}
+
+
+# ── Personal streaks ──────────────────────────────────────────────────────────
+# Both surfaces (/me and /me/card) call these, so the two can never drift apart —
+# they previously used different break conditions and reported different numbers
+# for the same stat. Ordered by kickoff, not by when the leaderboard row was
+# written: two-pass scoring rewrites rows via INSERT OR REPLACE, which would
+# otherwise shuffle an old rescored match to the front of "recent".
+
+async def _top_score_streak(username: str, limit: int = 50) -> int:
+    """Consecutive most-recent matches where the player topped one of their groups.
+
+    Compared only against the people they actually compete with, so opting out of
+    Global changes who they are measured against. Topping any one of their groups
+    counts, and a shared top score counts.
+    """
+    async with _db.execute(
+        """SELECT MAX(CASE WHEN l.points >= (
+                        SELECT MAX(l2.points) FROM leaderboard l2
+                         WHERE l2.match_id = l.match_id AND l2.group_id = l.group_id)
+                      THEN 1 ELSE 0 END) AS topped
+             FROM leaderboard l
+             JOIN group_members gm
+               ON gm.group_id = l.group_id AND gm.username = l.username
+             JOIN match_results r ON r.match_id = l.match_id
+            WHERE l.username = ?
+            GROUP BY l.match_id
+            ORDER BY MAX(r.kickoff_ts) DESC
+            LIMIT ?""",
+        (username, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    streak = 0
+    for r in rows:
+        if not r["topped"]:
+            break
+        streak += 1
+    return streak
+
+
+async def _best_top_score_streak(username: str, limit: int = 200) -> int:
+    """Longest run of matches the player ever topped.
+
+    Topping every match in a row is genuinely hard — six of eight players sit on zero
+    at any given moment — so the current streak alone reads as a dead stat. The best
+    run gives them something that survives a bad weekend.
+    """
+    async with _db.execute(
+        """SELECT MAX(CASE WHEN l.points >= (
+                        SELECT MAX(l2.points) FROM leaderboard l2
+                         WHERE l2.match_id = l.match_id AND l2.group_id = l.group_id)
+                      THEN 1 ELSE 0 END) AS topped
+             FROM leaderboard l
+             JOIN group_members gm
+               ON gm.group_id = l.group_id AND gm.username = l.username
+             JOIN match_results r ON r.match_id = l.match_id
+            WHERE l.username = ?
+            GROUP BY l.match_id
+            ORDER BY MAX(r.kickoff_ts) ASC
+            LIMIT ?""",
+        (username, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    best = run = 0
+    for r in rows:
+        run = run + 1 if r["topped"] else 0
+        best = max(best, run)
+    return best
+
+
+async def _winner_streak(username: str, limit: int = 100) -> int:
+    """Consecutive most-recent correct winner picks. One wrong call resets it to zero."""
+    async with _db.execute(
+        """SELECT p.pred_winner, r.res_winner
+             FROM predictions p
+             JOIN match_results r ON r.match_id = p.match_id
+            WHERE p.username = ?
+              AND p.pred_winner IS NOT NULL AND p.pred_winner <> ''
+              AND r.res_winner  IS NOT NULL AND r.res_winner  <> ''
+            ORDER BY r.kickoff_ts DESC
+            LIMIT ?""",
+        (username, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    streak = 0
+    for r in rows:
+        if r["pred_winner"] != r["res_winner"]:
+            break
+        streak += 1
+    return streak
+
+
 # ── Me page ───────────────────────────────────────────────────────────────────
 @app.get("/me", response_class=HTMLResponse)
 async def me_page(request: Request):
@@ -1600,32 +2131,14 @@ async def me_page(request: Request):
 
     pending_invites = await _pending_invite_count(username)
 
-    # Overall stats — group_id=1 (Global) gives exactly one row per match per user
-    async with _db.execute(
-        """SELECT COALESCE(SUM(points),0) as total_pts,
-                  COUNT(*) as matches,
-                  COALESCE(SUM(exact_score),0) as exact_count
-           FROM leaderboard WHERE username=? AND group_id=1""",
-        (username,),
-    ) as cur:
-        overall = dict(await cur.fetchone())
-
+    overall = await _profile_totals(username)
     total_pts   = overall["total_pts"]
     exact_count = overall["exact_count"]
+    in_global   = await _in_global(username)
 
-    # Streak — consecutive scored matches, deduped via group_id=1
-    async with _db.execute(
-        """SELECT points FROM leaderboard WHERE username=? AND group_id=1
-           ORDER BY created_at DESC LIMIT 50""",
-        (username,),
-    ) as cur:
-        streak_rows = [r["points"] for r in await cur.fetchall()]
-    streak = 0
-    for pts in streak_rows:
-        if pts > 0:
-            streak += 1
-        else:
-            break
+    streak = await _top_score_streak(username)
+    best_streak = await _best_top_score_streak(username)
+    winner_run = await _winner_streak(username)
 
     # Per-group breakdown
     async with _db.execute(
@@ -1636,7 +2149,7 @@ async def me_page(request: Request):
            FROM group_members gm
            JOIN groups g ON g.id=gm.group_id
            LEFT JOIN leaderboard l ON l.group_id=gm.group_id AND l.username=gm.username
-           WHERE gm.username=? AND g.id != 1
+           WHERE gm.username=?
            GROUP BY g.id ORDER BY pts DESC""",
         (username,),
     ) as cur:
@@ -1812,12 +2325,15 @@ async def me_page(request: Request):
             ta_pred += 1
             try:
                 raw = json.loads(rp["res_try_scorers"])
-                if rp["pred_try_any"] in _scorer_names(raw): ta_hit += 1
+                # Normalised for the same reason _score_group is, so the accuracy shown
+                # on a profile always agrees with the points actually awarded.
+                if _norm_player(rp["pred_try_any"]) in {_norm_player(n) for n in _scorer_names(raw)}:
+                    ta_hit += 1
             except Exception:
                 pass
         if rp["pred_try_first"] and rp["res_first_try"]:
             tf_pred += 1
-            if rp["pred_try_first"] == rp["res_first_try"]: tf_hit += 1
+            if _norm_player(rp["pred_try_first"]) == _norm_player(rp["res_first_try"]): tf_hit += 1
 
     # Score accuracy — use resolved predictions count (not leaderboard rows)
     s_pred = len(resolved_preds)
@@ -1936,10 +2452,13 @@ async def me_page(request: Request):
     winner_acc = f"{round(w_hit/w_pred*100)}%" if w_pred else "—"
     missed_stat = f'<span style="color:var(--danger)">{missed_count}</span>' if missed_count else "0"
     stats_html = (
-        _stat("Points", total_pts, "all groups combined") +
+        _stat("Points", total_pts,
+              "across your leagues" + (" incl. Global" if in_global else "")) +
         _stat("Exact Scores", exact_count, f"{score_acc} of predictions") +
-        _stat("Winner Picks", f"{w_hit}/{w_pred}" if w_pred else "—", f"{winner_acc} correct") +
-        _stat("Hot Streak", f"{streak}🔥" if streak >= 2 else (streak if streak else "—"), "scored matches in a row")
+        _stat("Winner Picks", f"{winner_run}🔥" if winner_run >= 3 else (winner_run if winner_run else "—"),
+              f"in a row · {winner_acc} all-time") +
+        _stat("Hot Streak", f"{streak}🔥" if streak >= 2 else (streak if streak else "—"),
+              (f"in a row · best {best_streak}" if best_streak else "matches topped in a row"))
     )
 
     # Next match card
@@ -1990,9 +2509,12 @@ async def me_page(request: Request):
     else:
         next_match_html = ""
 
-    # Group position cards
+    # Group position cards. Global is excluded here because it gets its own card
+    # below with the join/leave control — listing it twice was confusing.
     group_cards_html = ""
     for gs in group_stats:
+        if gs["slug"] == "global":
+            continue
         medal = _medal(gs["rank"], 32)
         role_pill = ' <span class="role-pill">Admin</span>' if gs["role"] == "admin" else ""
         group_cards_html += f"""<a href="/groups/{_esc(gs['slug'])}" class="group-pos-card">
@@ -2005,6 +2527,33 @@ async def me_page(request: Request):
   </div>
   <span class="material-symbols-outlined" style="color:var(--muted);font-size:1.1rem">chevron_right</span>
 </a>"""
+
+    # Global league opt-in — the player's own choice, shown alongside their groups
+    _gq = request.query_params.get("global", "")
+    global_note = {
+        "joined": '<div class="gl-note gl-ok">You\'re in the Global league — your results now count server-wide.</div>',
+        "left":   '<div class="gl-note gl-ok">You\'ve left the Global league. Only your own groups count now.</div>',
+        "admin":  '<div class="gl-note gl-warn">The site admin can\'t leave the Global league.</div>',
+    }.get(_gq, "")
+    if in_global:
+        _gstat = next((g for g in group_stats if g["slug"] == "global"), None)
+        _gmeta = (f"{_gstat['pts']} pts · {_gstat['scored']} matches · {_gstat['exact_sc']} exact"
+                  if _gstat else "You're competing against everyone on the server.")
+        global_html = f"""{global_note}<div class="global-card">
+  <div>
+    <div class="gpc-name">Global league</div>
+    <div class="gpc-meta">{_gmeta}</div>
+  </div>
+  <form method="post" action="/global/leave"><button class="btn btn-sm btn-ghost" type="submit">Leave</button></form>
+</div>"""
+    else:
+        global_html = f"""{global_note}<div class="global-card">
+  <div>
+    <div class="gpc-name">Global league</div>
+    <div class="gpc-meta">Opt in to compete against everyone on the server. Your groups are unaffected.</div>
+  </div>
+  <form method="post" action="/global/join"><button class="btn btn-sm" type="submit">Join</button></form>
+</div>"""
 
     # Recent predictions list
     recent_html = ""
@@ -2068,6 +2617,11 @@ async def me_page(request: Request):
 .inv-count{{background:var(--accent3);color:#fff;font-size:.65rem;padding:.1rem .4rem;border-radius:99px}}
 .group-pos-card{{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem;margin-bottom:.6rem;transition:background .15s}}
 .group-pos-card:active{{background:var(--surface2)}}
+.global-card{{display:flex;align-items:center;justify-content:space-between;gap:1rem;background:var(--surface);border:1px dashed var(--border);border-radius:12px;padding:.9rem 1rem;margin-bottom:.6rem}}
+.global-card .gpc-meta{{max-width:34ch}}
+.gl-note{{font-size:.82rem;border-radius:8px;padding:.55rem .8rem;margin-bottom:.6rem}}
+.gl-ok{{background:rgba(34,168,74,.1);border:1px solid rgba(34,168,74,.25);color:var(--accent)}}
+.gl-warn{{background:rgba(245,166,35,.1);border:1px solid rgba(245,166,35,.3);color:var(--accent3)}}
 .gpc-left{{display:flex;align-items:center;gap:.75rem}}
 .gpc-rank{{font-size:1.5rem;min-width:2rem;text-align:center}}
 .gpc-name{{font-weight:600;font-size:.95rem}}
@@ -2251,6 +2805,7 @@ async def me_page(request: Request):
   <div class="section-block">
     <div class="section-title">Your Groups</div>
     {group_cards_html if group_cards_html else '<div style="color:var(--muted);font-size:.88rem">Not in any groups yet.</div>'}
+    {global_html}
   </div>
   <div class="section-block">
     <div class="section-title">Recent Predictions</div>
@@ -2292,32 +2847,20 @@ async def me_card(request: Request):
     user = await _get_user(username)
     is_admin = bool(user and user["is_admin"])
 
-    async with _db.execute(
-        """SELECT COALESCE(SUM(points),0) as pts, COUNT(*) as matches,
-                  COALESCE(SUM(exact_score),0) as exact_count
-           FROM leaderboard WHERE username=? AND group_id=1""",
-        (username,),
-    ) as cur:
-        s = dict(await cur.fetchone())
+    # Same source as /me, so the card and the profile can never disagree.
+    _t = await _profile_totals(username)
+    s = {"pts": _t["total_pts"], "matches": _t["matches"], "exact_count": _t["exact_count"]}
 
-    async with _db.execute(
-        "SELECT points FROM leaderboard WHERE username=? ORDER BY created_at DESC LIMIT 50",
-        (username,),
-    ) as cur:
-        streak = 0
-        for r in await cur.fetchall():
-            if r["points"] > 1: streak += 1
-            else: break
+    streak = await _top_score_streak(username)
 
     acc = f"{round(s['exact_count']/s['matches']*100)}%" if s["matches"] else "—"
 
     # Best group position
-    my_groups = await _get_user_groups(username)
+    # Global counts here only when the player opted into it, same as any other group.
+    my_groups = await _get_user_groups(username, include_global=True)
     best_rank = None
     best_group = None
     for g in my_groups:
-        if g["id"] == 1:
-            continue
         async with _db.execute(
             """SELECT COUNT(*)+1 as rank FROM (
                    SELECT username, SUM(points) as tp FROM leaderboard
@@ -2352,6 +2895,7 @@ body{{background:#f2f7f3;display:flex;flex-direction:column;align-items:center;j
 .card-footer{{text-align:center;font-size:.72rem;opacity:.45;letter-spacing:.06em;text-transform:uppercase}}
 .back-btn{{margin-top:1.25rem;display:inline-block;background:var(--header,#1f6e3a);color:#fff;border:none;border-radius:8px;font-family:'Barlow Condensed',sans-serif;font-size:.85rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:.5rem 1.1rem;cursor:pointer;text-decoration:none}}
 </style></head><body>
+<h1 style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap">{_esc(_ucfirst(username))} — Scrum player card</h1>
 <div class="card">
   <div class="card-logo"><img src="/static/wordmark.png" alt="Scrum"></div>
   <div style="display:flex;justify-content:center;margin-bottom:.75rem">
@@ -2708,6 +3252,9 @@ async def groups_create_post(request: Request):
                 "INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type) VALUES(?,?)", (gid, pt)
             )
     await _db.commit()
+    # A group created mid-season starts empty otherwise, even though its leagues may
+    # already have resolved matches its creator predicted.
+    await _backfill_member(gid, username)
     return RedirectResponse(url=f"/groups/{slug}", status_code=303)
 
 
@@ -2745,10 +3292,11 @@ async def group_home(request: Request, slug: str):
                   COALESCE(SUM(l.diff), 999999)     as total_diff
            FROM group_members gm
            LEFT JOIN leaderboard l ON l.group_id=? AND l.username=gm.username
+                                  AND COALESCE(l.kickoff_ts,0) >= ?
            WHERE gm.group_id=?
            GROUP BY gm.username
            ORDER BY total_points DESC, exact_count DESC, total_diff ASC, gm.username""",
-        (g["id"], g["id"]),
+        (g["id"], g["season_start_ts"] or 0, g["id"]),
     ) as cur:
         members = [dict(r) for r in await cur.fetchall()]
 
@@ -2941,9 +3489,10 @@ async def group_home(request: Request, slug: str):
                       COALESCE(AVG(l.diff),0)        as avg_diff
                FROM group_members gm
                LEFT JOIN leaderboard l ON l.group_id=? AND l.username=gm.username AND l.tournament=?
+                                      AND COALESCE(l.kickoff_ts,0) >= ?
                WHERE gm.group_id=?
                GROUP BY gm.username ORDER BY total_points DESC, exact_count DESC, COALESCE(SUM(l.diff),999999) ASC""",
-            (g["id"], league_slug, g["id"]),
+            (g["id"], league_slug, g["season_start_ts"] or 0, g["id"]),
         ) as cur:
             lb_rows = [dict(r) for r in await cur.fetchall()]
         standings_section = f"""<div class="page-section">
@@ -3410,6 +3959,8 @@ async def invite_accept(request: Request, token: str):
         (username, time.time(), token),
     )
     await _db.commit()
+    await _backfill_member(inv["group_id"], username)
+    await _db.commit()
     return RedirectResponse(url=f"/groups/{inv['slug']}", status_code=303)
 
 
@@ -3545,6 +4096,7 @@ async def group_join_link_post(request: Request, token: str):
             (uname, time.time(), token),
         )
         await _db.commit()
+        await _backfill_member(inv["group_id"], uname)
 
     if action == "join":
         # Logged-in user joining directly
@@ -3574,12 +4126,7 @@ async def group_join_link_post(request: Request, token: str):
         )
         await _db.commit()
         await _do_join(new_username, None)
-        # Also add to Global group
-        await _db.execute(
-            "INSERT OR IGNORE INTO group_members (group_id,username,role,joined_at) VALUES(1,?,?,?)",
-            (new_username, "member", time.time()),
-        )
-        await _db.commit()
+        # Global is not joined automatically — it is the player's choice from /me.
         resp = RedirectResponse(url=f"/groups/{inv['slug']}", status_code=303)
         resp.set_cookie(SESSION_COOKIE, _make_token(new_username, permanent=True),
                         max_age=60*60*24*365*5, httponly=True, samesite="lax")
@@ -4126,8 +4673,9 @@ async def group_archive_season(request: Request, slug: str, season_name: str = F
 
     async with _db.execute(
         """SELECT username, SUM(points) as tp, COUNT(*) as m, SUM(exact_score) as ex
-           FROM leaderboard WHERE group_id=? GROUP BY username""",
-        (g["id"],),
+           FROM leaderboard WHERE group_id=? AND COALESCE(kickoff_ts,0) >= ?
+           GROUP BY username""",
+        (g["id"], g["season_start_ts"] or 0),
     ) as cur:
         rows = [dict(r) for r in await cur.fetchall()]
     for r in rows:
@@ -4136,10 +4684,13 @@ async def group_archive_season(request: Request, slug: str, season_name: str = F
             (season_id, r["username"], r["tp"] or 0, r["m"] or 0, r["ex"] or 0),
         )
 
-    # Clear current leaderboard for this group
-    await _db.execute("DELETE FROM leaderboard WHERE group_id=?", (g["id"],))
+    # Roll the season over by moving the group's boundary rather than deleting rows.
+    # Current-season views filter on kickoff_ts >= season_start_ts, so the leaderboard
+    # resets to empty while last season stays inspectable match by match.
+    await _db.execute("UPDATE groups SET season_start_ts=? WHERE id=?", (time.time(), g["id"]))
     await _db.commit()
-    logger.info("Season archived: group %s season %s", slug, name)
+    logger.info("Season archived: group %s season %s — boundary moved, %d rows retained",
+                slug, name, len(rows))
     return RedirectResponse(url=f"/groups/{slug}/settings?archived=1", status_code=303)
 
 
@@ -4218,6 +4769,12 @@ async def group_delete(request: Request, slug: str, confirm: str = Form(default=
     if confirm != g["name"]:
         return RedirectResponse(url=f"/groups/{slug}/settings?delete_error=1", status_code=303)
 
+    # Custom competitions hang off the group and were previously left behind, so every
+    # group delete stranded its comps and their match rows. Children first.
+    await _db.execute(
+        "DELETE FROM custom_competition_matches WHERE comp_id IN "
+        "(SELECT id FROM custom_competitions WHERE group_id=?)", (g["id"],))
+    await _db.execute("DELETE FROM custom_competitions WHERE group_id=?", (g["id"],))
     await _db.execute("DELETE FROM group_prediction_types WHERE group_id=?", (g["id"],))
     await _db.execute("DELETE FROM group_leagues WHERE group_id=?", (g["id"],))
     await _db.execute("DELETE FROM group_invites WHERE group_id=?", (g["id"],))
@@ -4232,6 +4789,46 @@ async def group_delete(request: Request, slug: str, confirm: str = Form(default=
     await _db.commit()
     logger.info("Group deleted: %s by %s", slug, username)
     return RedirectResponse(url="/groups", status_code=303)
+
+
+# ── Global league opt-in ──────────────────────────────────────────────────────
+# Joining or leaving is the player's own decision — deliberately not an admin one.
+# Leaving keeps their leaderboard rows so the choice is reversible; the rows simply
+# stop counting, because every profile query joins through group_members.
+
+@app.post("/global/join")
+async def global_join(request: Request):
+    username = _get_session_user(request)
+    if not username:
+        return RedirectResponse(url="/login", status_code=303)
+    await _db.execute(
+        "INSERT OR IGNORE INTO group_members (group_id,username,role,joined_at) VALUES(?,?,?,?)",
+        (GLOBAL_GROUP_ID, username, "member", time.time()),
+    )
+    await _db.commit()
+    # Opting in mid-season would otherwise start them on zero while everyone else
+    # carries a season of history.
+    await _backfill_member(GLOBAL_GROUP_ID, username)
+    logger.info("Global league joined by %s", username)
+    return RedirectResponse(url="/me?global=joined", status_code=303)
+
+
+@app.post("/global/leave")
+async def global_leave(request: Request):
+    username = _get_session_user(request)
+    if not username:
+        return RedirectResponse(url="/login", status_code=303)
+    user = await _get_user(username)
+    if user and user["is_admin"]:
+        # The Global group must keep an owner, so the site admin cannot leave it.
+        return RedirectResponse(url="/me?global=admin", status_code=303)
+    await _db.execute(
+        "DELETE FROM group_members WHERE group_id=? AND username=?",
+        (GLOBAL_GROUP_ID, username),
+    )
+    await _db.commit()
+    logger.info("Global league left by %s", username)
+    return RedirectResponse(url="/me?global=left", status_code=303)
 
 
 # ── Predictions ───────────────────────────────────────────────────────────────
@@ -4585,38 +5182,28 @@ async def api_predict(
 
     btts_val = int(pred_btts) if pred_btts in ("0", "1") else None
 
-    # Banker: one per user per 7-day window, clear existing banker in same window if set
     banker_val = 1 if is_banker == "1" else 0
-    if banker_val:
-        week_start = now - (now % 604800)  # start of current UTC week
-        async with _db.execute(
-            "SELECT match_id FROM predictions WHERE username=? AND is_banker=1 AND kickoff_ts>=?",
-            (username, week_start),
-        ) as cur:
-            existing_banker = await cur.fetchone()
-        if existing_banker:
-            await _db.execute(
-                "UPDATE predictions SET is_banker=0 WHERE username=? AND match_id=?",
-                (username, existing_banker["match_id"]),
-            )
+    # The 7-day bucket is keyed off the match's kickoff, not submission time, so the
+    # rule reads as "one banker per round" regardless of when the pick was entered.
+    banker_week = _banker_week_start(kickoff_ts if kickoff_ts > 0 else now)
 
     try:
         await _db.execute(
             """INSERT INTO predictions
                (match_id,match_title,team_home,team_away,kickoff_ts,tournament,username,
-                score_home,score_away,pred_winner,pred_margin,pred_btts,pred_try_any,pred_try_first,is_banker,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                score_home,score_away,pred_winner,pred_margin,pred_btts,pred_try_any,pred_try_first,is_banker,created_at,season)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (slug, match_title.strip(), team_home.strip(), team_away.strip(),
              kickoff_ts, tournament.strip(), username,
              score_home, score_away,
              pred_winner.strip() or None, pred_margin.strip() or None, btts_val,
              pred_try_any.strip() or None, pred_try_first.strip() or None,
-             banker_val, time.time()),
+             banker_val, time.time(), _season_for(tournament.strip(), kickoff_ts)),
         )
-        await _db.commit()
-        return JSONResponse({"ok": True, "home": score_home, "away": score_away,
-                             "team_home": team_home, "team_away": team_away})
     except aiosqlite.IntegrityError:
+        # Nothing from this request may survive a failed insert — a duplicate submit
+        # must not be able to strip the banker off an existing pick.
+        await _db.rollback()
         async with _db.execute(
             "SELECT score_home, score_away, team_home, team_away FROM predictions WHERE match_id=? AND username=?",
             (slug, username),
@@ -4633,6 +5220,21 @@ async def api_predict(
             return JSONResponse({"ok": True, "home": d["score_home"], "away": d["score_away"],
                                  "team_home": d["team_home"], "team_away": d["team_away"]})
         return JSONResponse({"error": "already predicted"}, status_code=409)
+
+    # The insert succeeded, so it is now safe to move the banker off any other match
+    # in the same round. Bounded at both ends — an unbounded lower-only window let a
+    # banker on a later round be cleared by one entered for an earlier round. Excludes
+    # this match so a resubmit can never strip the pick it just set.
+    if banker_val:
+        await _db.execute(
+            """UPDATE predictions SET is_banker=0
+               WHERE username=? AND is_banker=1 AND match_id<>?
+                 AND kickoff_ts>=? AND kickoff_ts<?""",
+            (username, slug, banker_week, banker_week + 604800),
+        )
+    await _db.commit()
+    return JSONResponse({"ok": True, "home": score_home, "away": score_away,
+                         "team_home": team_home, "team_away": team_away})
 
 
 # ── Standings ─────────────────────────────────────────────────────────────────
@@ -5051,7 +5653,7 @@ async def how_to_play(request: Request):
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>How to Play · Scrum</title>{_FONTS}<style>{_BASE_CSS}
 .htp-wrap{{max-width:680px;margin:0 auto;padding:1.5rem 1rem 5rem}}
-.htp-wrap h1{{font-family:'Barlow Condensed',sans-serif;font-size:1.8rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin:0 0 .25rem}}
+.htp-wrap .page-title{{font-family:'Barlow Condensed',sans-serif;font-size:1.8rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin:0 0 .25rem}}
 .htp-subtitle{{color:var(--muted);font-size:.9rem;margin-bottom:2rem}}
 .htp-section{{margin-bottom:2rem}}
 .htp-section h2{{font-family:'Barlow Condensed',sans-serif;font-size:1.1rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--header);margin:1.1rem 0 .6rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}}
@@ -5085,7 +5687,7 @@ async def how_to_play(request: Request):
 </style></head><body>
 {_nav(username, is_admin, "how-to-play")}
 <div class="htp-wrap page-body">
-  <h1>How to Play</h1>
+  <h2 class="page-title">How to Play</h2>
   <p class="htp-subtitle">Predict rugby matches, earn points, compete in private groups with friends.</p>
 
   <div class="htp-section">
@@ -5327,7 +5929,12 @@ async def history_page(request: Request, t: str = "all"):
 {_FONTS}{_PWA_META}<style>{_BASE_CSS}
 .page-body{{max-width:700px;margin:0 auto;padding:1.25rem 1rem 5rem}}
 .page-title{{font-family:'Barlow Condensed',sans-serif;font-size:1.5rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:1rem}}
-.t-tabs{{display:flex;gap:.5rem;margin-bottom:1.25rem}}
+/* The strip is far wider than a phone, so it needs to look scrollable: a fade on the
+   right edge is the only cue that more competitions exist off-screen. */
+.t-tabs{{display:flex;gap:.5rem;margin-bottom:1.25rem;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;
+  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%);
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%)}}
+.t-tabs::-webkit-scrollbar{{display:none}}
 .t-tab{{font-family:'Barlow Condensed',sans-serif;font-size:.82rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:.35rem .9rem;border-radius:6px;border:1px solid var(--border);color:var(--muted);white-space:nowrap;transition:all .2s;flex-shrink:0}}
 .t-tab:hover{{color:var(--text)}}.t-tab.active{{color:var(--header);border-color:var(--header);background:rgba(31,110,58,.08)}}
 @media(max-width:768px){{.t-tabs{{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}}.t-tabs::-webkit-scrollbar{{display:none}}}}
@@ -5434,19 +6041,25 @@ async def leaderboard(request: Request, t: str = "all"):
         is_custom = m_slug in all_custom_mids
         if not in_tourn and not is_custom:
             continue
+        # Fixtures inside the fortnight always show. Beyond that, keep the next few of
+        # each competition so a big event further out is still discoverable — a flat
+        # 14-day cap hid the whole tour, whose first Test is 17 days away.
         if kts and kts > now_ts + 14 * 86400 and not is_custom:
-            continue
+            if len(by_tourn.get(m["tournament"], [])) >= UPCOMING_PER_LEAGUE:
+                continue
         if in_tourn:
             by_tourn[m["tournament"]].append(m)
         elif is_custom:
-            t = m["tournament"] if m["tournament"] in by_tourn else "international"
-            by_tourn.setdefault(t, []).append(m)
+            # Must not be named `t` — that is the selected-tab parameter, and
+            # reassigning it here silently switched which tab the page rendered.
+            ct = m["tournament"] if m["tournament"] in by_tourn else "international"
+            by_tourn.setdefault(ct, []).append(m)
         seen_slugs.add(m_slug)
     # Add custom comp matches not in ESPN window yet
     for mid, cm in all_custom_match_meta.items():
         if mid not in seen_slugs and cm["kickoff_ts"] > now_ts:
-            t = cm["tournament"] if cm["tournament"] in by_tourn else "international"
-            by_tourn.setdefault(t, []).append({
+            ct = cm["tournament"] if cm["tournament"] in by_tourn else "international"
+            by_tourn.setdefault(ct, []).append({
                 "tournament": cm["tournament"], "tournament_name": ALL_ESPN_LEAGUES.get(cm["tournament"], (None, cm["tournament"]))[1],
                 "espn_id": cm["espn_id"] or "", "league_id": cm["league_id"],
                 "team_home": cm["team_home"], "team_away": cm["team_away"],
@@ -5502,14 +6115,42 @@ async def leaderboard(request: Request, t: str = "all"):
         if count:
             unpredicted[key] = count
 
+    # Competitions with results already in the books keep a tab even once their
+    # fixtures run out, so finished seasons stay browsable.
+    async with _db.execute("SELECT DISTINCT tournament FROM match_results") as cur:
+        played_slugs = {r["tournament"] for r in await cur.fetchall() if r["tournament"]}
+
     # Build tab bar: "All" first, then tournament tabs
     total_unpredicted = sum(unpredicted.values())
     all_badge = f'<span class="t-badge">{total_unpredicted}</span>' if total_unpredicted else ""
+    # Tab order follows what is actually happening. The strip is far wider than a
+    # phone (16 competitions is ~2300px), so anything not near the front is behind a
+    # long swipe — which is where the current tour ended up before this. Leagues with
+    # a fixture coming up sort by soonest kickoff; dormant ones fall to the back, and
+    # ones with nothing at all this season are dropped rather than taking up space.
+    _soonest = {}
+    for _slug, _ms in by_tourn.items():
+        if _ms:
+            _soonest[_slug] = min(m["kickoff_ts"] for m in _ms)
+
+    def _tab_rank(slug: str):
+        if slug in _soonest:
+            return (0, _soonest[slug])
+        return (1, 0)
+
+    _ordered = [k for k in TOURNAMENTS if k in _soonest or k == t or k in played_slugs]
+    _ordered.sort(key=_tab_rank)
+
     tabs = f'<a href="/leaderboard?t=all" class="t-tab{"  active" if t == "all" else ""}">All{all_badge}</a>'
-    for key, label in TOURNAMENTS.items():
+    for key in _ordered:
+        label = TOURNAMENTS[key]
         active_cls = " active" if key == t else ""
         badge = f'<span class="t-badge">{unpredicted[key]}</span>' if key in unpredicted else ""
         tabs += f'<a href="/leaderboard?t={key}" class="t-tab{active_cls}">{label}{badge}</a>'
+    # The strip is wider than the screen, so the selected tab can land off-view or half
+    # cut off after navigating to it. Pull it into sight on load.
+    tabs += ("<script>requestAnimationFrame(()=>{const a=document.querySelector('.t-tabs .t-tab.active');"
+             "if(a)a.scrollIntoView({block:'nearest',inline:'center'});});</script>")
 
     # ── "All" tab: show all upcoming fixtures grouped by tournament ──────────
     if t == "all":
@@ -5587,20 +6228,22 @@ async def leaderboard(request: Request, t: str = "all"):
 
         # 3. Standings for this tournament
         async with _db.execute(
-            """SELECT username,
-                      SUM(points)           as total_points,
-                      COUNT(*)              as played,
-                      SUM(exact_score)      as exact_scores,
-                      ROUND(AVG(diff),1)    as avg_diff,
-                      SUM(pts_score)        as pts_score,
-                      SUM(pts_winner)       as pts_winner,
-                      SUM(pts_margin)       as pts_margin,
-                      SUM(pts_btts)         as pts_btts,
-                      SUM(pts_try_any)+SUM(pts_try_first) as pts_try,
-                      SUM(pts_motm)         as pts_motm,
-                      SUM(pts_banker)       as pts_banker
-               FROM leaderboard WHERE group_id=1 AND tournament=?
-               GROUP BY username
+            """SELECT l.username             as username,
+                      SUM(l.points)          as total_points,
+                      COUNT(*)               as played,
+                      SUM(l.exact_score)     as exact_scores,
+                      ROUND(AVG(l.diff),1)   as avg_diff,
+                      SUM(l.pts_score)      as pts_score,
+                      SUM(l.pts_winner)     as pts_winner,
+                      SUM(l.pts_margin)     as pts_margin,
+                      SUM(l.pts_btts)       as pts_btts,
+                      SUM(l.pts_try_any)+SUM(l.pts_try_first) as pts_try,
+                      SUM(l.pts_motm)       as pts_motm,
+                      SUM(l.pts_banker)     as pts_banker
+               FROM leaderboard l
+               JOIN group_members gm ON gm.group_id=l.group_id AND gm.username=l.username
+               WHERE l.group_id=1 AND l.tournament=?
+               GROUP BY l.username
                ORDER BY total_points DESC, exact_scores DESC, avg_diff ASC""",
             (t,),
         ) as cur:
@@ -5984,11 +6627,21 @@ async def admin_page(request: Request):
       </div>
       <div class="rf-field" style="flex:.5">
         <label>Final: Home</label>
-        <input type="number" name="final_home" min="0" max="300" required style="width:80px">
+        <input type="number" name="final_home" min="0" max="300" required style="width:80px" aria-label="Final score, home team">
       </div>
       <div class="rf-field" style="flex:.5">
         <label>Final: Away</label>
-        <input type="number" name="final_away" min="0" max="300" required style="width:80px">
+        <input type="number" name="final_away" min="0" max="300" required style="width:80px" aria-label="Final score, away team">
+      </div>
+    </div>
+    <div class="rf-row">
+      <div class="rf-field">
+        <label>Try scorers <span style="font-weight:400;color:var(--muted)">— comma separated, in order scored</span></label>
+        <input type="text" name="try_scorers" placeholder="Cheslin Kolbe, Will Jordan, …" aria-label="Try scorers, comma separated in the order they were scored">
+      </div>
+      <div class="rf-field" style="flex:.6">
+        <label>First try <span style="font-weight:400;color:var(--muted)">— blank = first above</span></label>
+        <input type="text" name="first_try" placeholder="Cheslin Kolbe" aria-label="First try scorer">
       </div>
     </div>
     <button type="submit" class="btn btn-sm">Enter Result & Calculate Points</button>
@@ -6017,8 +6670,14 @@ async def admin_page(request: Request):
       <input type="hidden" name="tournament" value="{_esc(r['tournament'] or '')}">
       <input type="hidden" name="kickoff_ts" value="{r['kickoff_ts']}">
       <div class="rf-row">
-        <div class="rf-field"><label>{_esc(r['team_home'])}</label><input type="number" name="final_home" value="{r['final_home']}" min="0" max="200" required></div>
-        <div class="rf-field"><label>{_esc(r['team_away'])}</label><input type="number" name="final_away" value="{r['final_away']}" min="0" max="200" required></div>
+        <div class="rf-field"><label>{_esc(r['team_home'])}</label><input type="number" name="final_home" value="{r['final_home']}" min="0" max="200" required aria-label="Final score for {_esc(r['team_home'])}"></div>
+        <div class="rf-field"><label>{_esc(r['team_away'])}</label><input type="number" name="final_away" value="{r['final_away']}" min="0" max="200" required aria-label="Final score for {_esc(r['team_away'])}"></div>
+      </div>
+      <div class="rf-row">
+        <div class="rf-field"><label>Try scorers <span style="font-weight:400;color:var(--muted)">— comma separated, in order</span></label>
+          <input type="text" name="try_scorers" value="{_esc(', '.join(_scorer_names(json.loads(r['res_try_scorers'] or '[]') or [])))}" aria-label="Try scorers, comma separated in the order they were scored"></div>
+        <div class="rf-field" style="flex:.6"><label>First try</label>
+          <input type="text" name="first_try" value="{_esc(r['res_first_try'] or '')}" aria-label="First try scorer"></div>
       </div>
       <button type="submit" class="btn btn-sm">Update Result</button>
     </form>
@@ -6086,6 +6745,10 @@ main{{max-width:780px;margin:2rem auto;padding:0 1.5rem;display:flex;flex-direct
         <form method="post" action="/admin/squads/pre-fetch" style="display:inline">
           <button type="submit" class="btn btn-sm btn-ghost">⟳ Fetch Squads</button>
         </form>
+        <form method="post" action="/admin/backfill" style="display:inline"
+              onsubmit="return confirm('Score every member\\'s resolved predictions in the groups they belong to? Safe to re-run.')">
+          <button type="submit" class="btn btn-sm btn-ghost">⟳ Backfill Members</button>
+        </form>
       </div>
     </div>
     {pending_html}
@@ -6115,7 +6778,33 @@ async def admin_pre_fetch_squads(request: Request):
         return RedirectResponse(url="/", status_code=303)
     await _redis.delete("espn:upcoming")  # force fresh fetch with espn_id populated
     await _pre_fetch_squads()
+    await _seed_missing_squads()
     return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/backfill")
+async def admin_backfill(request: Request):
+    """Score every member's already-resolved predictions in the groups they belong to.
+
+    _backfill_member runs automatically on join, but members who joined before that
+    existed still carry gaps — a group created mid-season starts empty, and anyone
+    added after a match resolved has no row for it. Safe to re-run: it only touches
+    matches that have no leaderboard row yet.
+    """
+    username, _ = await _require_admin(request)
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+    async with _db.execute("SELECT group_id, username FROM group_members") as cur:
+        members = [(r["group_id"], r["username"]) for r in await cur.fetchall()]
+    total = 0
+    for gid, uname in members:
+        try:
+            total += await _backfill_member(gid, uname)
+        except Exception as exc:
+            logger.warning("Backfill sweep error for %s in group %s: %s", uname, gid, exc)
+    logger.info("Backfill sweep by %s: %d matches scored across %d memberships",
+                username, total, len(members))
+    return RedirectResponse(url=f"/admin?backfilled={total}", status_code=303)
 
 
 @app.post("/admin/users/create")
@@ -6224,6 +6913,8 @@ async def admin_enter_result(
     kickoff_ts: float = Form(default=0),
     final_home: int = Form(...),
     final_away: int = Form(...),
+    try_scorers: str = Form(default=""),
+    first_try: str = Form(default=""),
 ):
     username, _ = await _require_admin(request)
     if not username:
@@ -6233,25 +6924,37 @@ async def admin_enter_result(
     margin = _calc_margin_band(abs(final_home - final_away))
     btts = 1 if final_home > 0 and final_away > 0 else 0
 
-    # Preserve existing try scorer data if result already exists
+    # Try scorers typed in by the admin win; otherwise whatever ESPN already found is
+    # preserved. Needed because ESPN carries no data at all for some fixtures (the
+    # tour's provincial games), and without this the anytime-try and first-try
+    # predictions on those matches could never resolve — 7 of the 17 points a match
+    # is worth, silently lost for everyone who picked one.
     async with _db.execute(
         "SELECT res_try_scorers, res_first_try FROM match_results WHERE match_id=?", (match_id,)
     ) as cur:
         existing = await cur.fetchone()
     existing = dict(existing) if existing else {}
 
+    typed = [n.strip() for n in try_scorers.split(",") if n.strip()]
+    if typed:
+        existing["res_try_scorers"] = json.dumps(
+            [{"name": n, "team": "", "clock": ""} for n in typed])
+        existing["res_first_try"] = first_try.strip() or typed[0]
+    elif first_try.strip():
+        existing["res_first_try"] = first_try.strip()
+
     await _db.execute(
         """INSERT OR REPLACE INTO match_results
            (match_id,match_title,team_home,team_away,tournament,kickoff_ts,
             final_home,final_away,entered_by,entered_at,
             res_winner,res_margin,res_btts,
-            res_try_scorers,res_first_try,motm_pending)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            res_try_scorers,res_first_try,motm_pending,season)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (match_id, match_title.strip(), team_home.strip(), team_away.strip(),
          tournament, kickoff_ts, final_home, final_away, username, time.time(),
          winner, margin, btts,
          existing.get("res_try_scorers"), existing.get("res_first_try"),
-         0),
+         0, _season_for(tournament, kickoff_ts)),
     )
     await _db.commit()
 
