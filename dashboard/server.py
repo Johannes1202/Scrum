@@ -117,6 +117,14 @@ DERIVED_BY_SLUG = {d["slug"]: d for d in DERIVED_LEAGUES}
 # Without this, next season's URC would pile onto this season's under the same slug.
 SPLIT_SEASON_LEAGUES = {"urc", "premiership", "top-14", "champions-cup", "challenge-cup"}
 
+# Season boundary. Everything before this was cleared on 5 Aug 2026 so the group
+# started level from the first Nations Championship match, agreed with the players.
+# The companion results backfill reaches 45 days into the past and would otherwise
+# refill the table with exactly what the cutover removed, an hour at a time.
+RESULTS_FLOOR = os.environ.get("RESULTS_FLOOR", "2026-07-04")
+RESULTS_FLOOR_TS = datetime.strptime(RESULTS_FLOOR, "%Y-%m-%d").replace(
+    tzinfo=timezone.utc).timestamp()
+
 # How many fixtures per competition survive past the fortnight window on the Predict
 # page. Eight covers a full tour (four Tests plus four midweek games) end to end,
 # without Top 14's 71 upcoming fixtures burying everything else.
@@ -1036,6 +1044,11 @@ async def _auto_apply_results() -> tuple[int, int]:
     # This powers the companion Results page even for leagues nobody predicted on
     for espn_match in espn:
         if not espn_match.get("espn_id"):
+            continue
+        # Nothing from before the season boundary comes back. This loop stores every
+        # ESPN result it can see, not just predicted ones, so without the floor it
+        # quietly refilled the table with matches the cutover had just removed.
+        if (espn_match.get("event_ts") or 0) < RESULTS_FLOOR_TS:
             continue
         slug = espn_match["espn_id"]
         async with _db.execute(

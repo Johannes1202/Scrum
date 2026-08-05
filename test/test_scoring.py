@@ -432,6 +432,16 @@ async def main():
     check("leaderboard row carries the season", row["season"], "2026")
     check("leaderboard row carries the kickoff", row["kickoff_ts"], ts_("2026-08-22"))
 
+    # ── Season floor ──────────────────────────────────────────────────────────
+    # The companion backfill stores every ESPN result it can see, reaching 45 days
+    # back. Without a floor it refilled the table with matches the cutover had just
+    # removed — caught in production minutes after the 5 Aug cutover.
+    floor = server.RESULTS_FLOOR_TS
+    check("floor is the Nations Championship cutoff", floor, ts_("2026-07-04"))
+    check("a June match is below the floor", ts_("2026-06-27") < floor, True)
+    check("a Nations Championship match is above it", ts_("2026-07-11") > floor, True)
+    check("the tour is above it", ts_("2026-08-07") > floor, True)
+
     # ── Banker week bucketing ─────────────────────────────────────────────────
     wk = server._banker_week_start
     check("same round shares a bucket", wk(KICKOFF), wk(KICKOFF + 3600 * 24))
