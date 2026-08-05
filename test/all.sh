@@ -25,7 +25,7 @@ docker exec "$CONTAINER" rm -rf /app/test
 docker cp "$(dirname "$0")" "$CONTAINER:/app/test" >/dev/null || {
     echo "error: could not copy test/ into $CONTAINER"; exit 2; }
 
-for suite in test_derived_leagues test_scoring test_live_espn; do
+for suite in test_derived_leagues test_scoring test_auth test_live_espn; do
     echo "── $suite ──────────────────────────────────────────"
     if docker exec "$CONTAINER" python3 "/app/test/$suite.py"; then
         RESULTS+=("  PASS  $suite")

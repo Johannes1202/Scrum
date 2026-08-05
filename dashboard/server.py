@@ -39,6 +39,14 @@ ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", os.environ.get("STREAM_PASSWO
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Verified against when no such account exists, so a wrong username and a wrong
+# password take the same time and the response cannot be used to enumerate names.
+_DUMMY_HASH = pwd_ctx.hash("scrum-timing-equaliser")
+
+# Session cookies are only sent over HTTPS in production. Off by default so a plain
+# HTTP deployment (or a LAN dev box) still works without silently breaking login.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+
 # Overridable so the module can be imported outside the container (tests, tooling).
 # Creation is best-effort for the same reason — the app only needs it to serve avatars.
 AVATAR_DIR = os.getenv("AVATAR_DIR", "/data/avatars")
@@ -1428,6 +1436,71 @@ def _get_session_user(request: Request) -> str | None:
     return _token_to_user(request.cookies.get(SESSION_COOKIE, ""))
 
 
+# ── Login throttling ──────────────────────────────────────────────────────────
+# Counters live in Redis so they survive a restart and are shared by every worker.
+# Two separate limits: one per account, so a single target cannot be ground down,
+# and a looser one per address to slow a spray across many accounts. The per-address
+# limit is deliberately generous — a household or an office shares one address, and
+# locking out a whole group of mates would be worse than the attack.
+LOGIN_WINDOW      = 900   # 15 minutes
+LOGIN_MAX_USER    = 8     # failures for one username before it is locked
+LOGIN_MAX_IP      = 40    # failures from one address before it is locked
+
+
+def _client_ip(request: Request) -> str:
+    """Real client address. Behind the Cloudflare tunnel every request otherwise
+    appears to come from the tunnel container, which would throttle all users as one."""
+    for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+        value = request.headers.get(header)
+        if value:
+            return value.split(",")[0].strip()[:45]
+    return request.client.host if request.client else "unknown"
+
+
+async def _login_retry_after(username: str, ip: str) -> int:
+    """Seconds until this username/address may try again, 0 if it may try now."""
+    if not _redis:
+        return 0
+    try:
+        for key, limit in ((f"login:fail:u:{username}", LOGIN_MAX_USER),
+                           (f"login:fail:i:{ip}", LOGIN_MAX_IP)):
+            count = await _redis.get(key)
+            if count and int(count) >= limit:
+                ttl = await _redis.ttl(key)
+                return max(ttl, 1)
+    except Exception as exc:
+        # Never lock everyone out because Redis hiccuped.
+        logger.warning("Login throttle check failed, allowing: %s", exc)
+    return 0
+
+
+async def _login_record_failure(username: str, ip: str) -> None:
+    if not _redis:
+        return
+    try:
+        for key in (f"login:fail:u:{username}", f"login:fail:i:{ip}"):
+            n = await _redis.incr(key)
+            if n == 1:
+                await _redis.expire(key, LOGIN_WINDOW)
+    except Exception as exc:
+        logger.warning("Login throttle record failed: %s", exc)
+
+
+async def _login_clear(username: str, ip: str) -> None:
+    if not _redis:
+        return
+    try:
+        await _redis.delete(f"login:fail:u:{username}", f"login:fail:i:{ip}")
+    except Exception as exc:
+        logger.warning("Login throttle clear failed: %s", exc)
+
+
+def _retry_msg(seconds: int) -> str:
+    mins = (seconds + 59) // 60
+    return (f"Too many failed attempts. Try again in {mins} minute"
+            f"{'s' if mins != 1 else ''}.")
+
+
 
 async def _get_user(username: str) -> dict | None:
     if not username:
@@ -1792,7 +1865,7 @@ Ask the admin for a new one.</p></div></body></html>""", status_code=410)
     username = row["username"]
     resp = RedirectResponse(url="/", status_code=303)
     resp.set_cookie(SESSION_COOKIE, _make_token(username, permanent=True),
-                    max_age=60*60*24*365*5, httponly=True, samesite="lax")
+                    max_age=60*60*24*365*5, httponly=True, samesite="lax", secure=COOKIE_SECURE)
     logger.info("Magic link used: %s", username)
     return resp
 
@@ -1825,20 +1898,38 @@ body{{display:flex;align-items:center;justify-content:center;background-image:ra
 @app.post("/login")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
     username = username.lower().strip()
+    ip = _client_ip(request)
+
+    retry_after = await _login_retry_after(username, ip)
+    if retry_after:
+        logger.warning("Login throttled: %s from %s, %ss remaining", username, ip, retry_after)
+        return login_page(_retry_msg(retry_after))
+
     async with _db.execute("SELECT password_hash FROM users WHERE username=?", (username,)) as cur:
         row = await cur.fetchone()
+
     if row and pwd_ctx.verify(password, row["password_hash"]):
+        await _login_clear(username, ip)
         resp = RedirectResponse(url="/", status_code=303)
         resp.set_cookie(SESSION_COOKIE, _make_token(username),
-                        max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
+                        max_age=SESSION_MAX_AGE, httponly=True,
+                        samesite="lax", secure=COOKIE_SECURE)
         return resp
+
+    if not row:
+        # Hash a throwaway value so a missing account costs the same time as a wrong
+        # password — otherwise the response time alone reveals which names exist.
+        pwd_ctx.verify(password, _DUMMY_HASH)
+
+    await _login_record_failure(username, ip)
+    logger.info("Failed login for %s from %s", username, ip)
     return login_page("Invalid username or password")
 
 
 @app.get("/logout")
 def logout():
     resp = RedirectResponse(url="/login", status_code=303)
-    resp.delete_cookie(SESSION_COOKIE, httponly=True, samesite="lax")
+    resp.delete_cookie(SESSION_COOKIE, httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return resp
 
 
@@ -4142,7 +4233,7 @@ async def group_join_link_post(request: Request, token: str):
         # Global is not joined automatically — it is the player's choice from /me.
         resp = RedirectResponse(url=f"/groups/{inv['slug']}", status_code=303)
         resp.set_cookie(SESSION_COOKIE, _make_token(new_username, permanent=True),
-                        max_age=60*60*24*365*5, httponly=True, samesite="lax")
+                        max_age=60*60*24*365*5, httponly=True, samesite="lax", secure=COOKIE_SECURE)
         logger.info("Self-registered via invite: %s → group %s", new_username, inv["slug"])
         return resp
 
@@ -4156,7 +4247,7 @@ async def group_join_link_post(request: Request, token: str):
         await _do_join(login_username, None)
         resp = RedirectResponse(url=f"/groups/{inv['slug']}", status_code=303)
         resp.set_cookie(SESSION_COOKIE, _make_token(login_username),
-                        max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
+                        max_age=SESSION_MAX_AGE, httponly=True, samesite="lax", secure=COOKIE_SECURE)
         return resp
 
     return RedirectResponse(url=f"/groups/join/{token}", status_code=303)
@@ -7072,7 +7163,7 @@ async def me_change_username(request: Request, new_username: str = Form(...)):
     # Issue a new session cookie with the new username
     resp = RedirectResponse(url="/me?un=ok", status_code=303)
     resp.set_cookie(SESSION_COOKIE, _make_token(new_username),
-                    max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
+                    max_age=SESSION_MAX_AGE, httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return resp
 
 
