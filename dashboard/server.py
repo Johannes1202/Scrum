@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 import httpx
+from PIL import Image
 import redis.asyncio as aioredis
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, Response, UploadFile
@@ -179,11 +181,15 @@ def _fixture_key(m: dict) -> tuple:
     return sides + (day,)
 
 
-def _with_manual_fixtures(matches: list[dict]) -> list[dict]:
-    """Merge declared fixtures into an ESPN feed, letting real ESPN events take priority."""
+def _with_manual_fixtures(matches: list[dict], db_rows: list[dict] | None = None) -> list[dict]:
+    """Merge declared fixtures into an ESPN feed, letting real ESPN events take priority.
+
+    db_rows carries fixtures an admin accepted from a discovery; the config list covers
+    ones committed to source. Both are treated identically from here on.
+    """
     have = {_fixture_key(m) for m in matches}
     extra = []
-    for r in _manual_fixture_rows():
+    for r in _manual_fixture_rows() + list(db_rows or []):
         if _fixture_key(r) in have:
             logger.info("Manual fixture %s superseded by ESPN", r["slug"])
             continue
@@ -191,6 +197,25 @@ def _with_manual_fixtures(matches: list[dict]) -> list[dict]:
     merged = list(matches) + extra
     merged.sort(key=lambda x: x.get("kickoff_ts") or 0)
     return merged
+
+
+async def _db_manual_fixture_rows() -> list[dict]:
+    """Admin-accepted fixtures, shaped like the ESPN feed."""
+    try:
+        async with _db.execute(
+            "SELECT match_id, tournament, team_home, team_away, kickoff_ts, venue "
+            "FROM manual_fixtures") as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        return []
+    return [{
+        "tournament": r["tournament"],
+        "tournament_name": ALL_ESPN_LEAGUES.get(r["tournament"], (None, r["tournament"]))[1],
+        "espn_id": "", "slug": r["match_id"], "league_id": None,
+        "team_home": r["team_home"], "team_away": r["team_away"],
+        "kickoff_ts": r["kickoff_ts"], "in_progress": False,
+        "manual": True, "venue": r["venue"] or "",
+    } for r in rows]
 
 
 def _manual_fixture_rows() -> list[dict]:
@@ -533,6 +558,25 @@ async def _init_db():
         logger.warning("Season backfill skipped: %s", exc)
 
     for ddl in [
+        # Team registry: ESPN's id is the key, so crests can never be matched to the
+        # wrong club by name. has_crest records whether the image is on disk yet.
+        "CREATE TABLE IF NOT EXISTS teams (espn_id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "league_id INTEGER, has_crest INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_teams_name ON teams(name)",
+        "ALTER TABLE teams ADD COLUMN sportsdb_id TEXT",
+        # Fixtures a secondary source knows about that Scrum does not. Advisory only —
+        # nothing here affects scoring until an admin explicitly adds it.
+        "CREATE TABLE IF NOT EXISTS discovered_fixtures ("
+        "  ext_id TEXT PRIMARY KEY, source TEXT NOT NULL, team_home TEXT NOT NULL,"
+        "  team_away TEXT NOT NULL, kickoff_ts REAL NOT NULL, league TEXT,"
+        "  venue TEXT, status TEXT NOT NULL DEFAULT 'pending', seen_at REAL NOT NULL,"
+        "  decided_at REAL, decided_by TEXT)",
+        # Fixtures an admin accepted from a discovery, or added by hand. Read alongside
+        # the MANUAL_FIXTURES in config.
+        "CREATE TABLE IF NOT EXISTS manual_fixtures ("
+        "  match_id TEXT PRIMARY KEY, tournament TEXT NOT NULL, team_home TEXT NOT NULL,"
+        "  team_away TEXT NOT NULL, kickoff_ts REAL NOT NULL, venue TEXT,"
+        "  created_at REAL NOT NULL, created_by TEXT)",
         "CREATE TABLE IF NOT EXISTS custom_competitions (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL REFERENCES groups(id), name TEXT NOT NULL, slug TEXT NOT NULL, created_at REAL NOT NULL, UNIQUE(group_id, slug))",
         "CREATE TABLE IF NOT EXISTS custom_competition_matches (comp_id INTEGER NOT NULL REFERENCES custom_competitions(id), match_id TEXT NOT NULL, espn_id TEXT, league_id INTEGER, team_home TEXT NOT NULL, team_away TEXT NOT NULL, kickoff_ts REAL NOT NULL, tournament TEXT NOT NULL, PRIMARY KEY (comp_id, match_id))",
     ]:
@@ -1193,6 +1237,230 @@ async def _harvest_players(match_id: str, league_id: int) -> int:
     return stored
 
 
+async def _sync_teams() -> int:
+    """Populate the team registry from ESPN's per-league team lists.
+
+    Keyed on ESPN's team id rather than the display name, so a crest can never end up
+    on the wrong club. New teams are added; existing rows keep their id.
+    """
+    added = 0
+    for slug, (league_id, _) in ALL_ESPN_LEAGUES.items():
+        if slug in DERIVED_BY_SLUG:
+            continue  # same source league as their parent, already covered
+        url = f"https://site.api.espn.com/apis/site/v2/sports/rugby/{league_id}/teams?limit=100"
+        try:
+            resp = await _http_client.get(url, timeout=15)
+            if resp.status_code != 200:
+                continue
+            leagues = resp.json().get("sports", [{}])[0].get("leagues", [])
+            teams = leagues[0].get("teams", []) if leagues else []
+        except Exception as exc:
+            logger.warning("Team sync failed for %s: %s", slug, exc)
+            continue
+        for entry in teams:
+            team = entry.get("team") or {}
+            espn_id, name = team.get("id"), team.get("displayName")
+            if not espn_id or not name:
+                continue
+            try:
+                cur = await _db.execute(
+                    """INSERT INTO teams (espn_id,name,league_id,updated_at) VALUES(?,?,?,?)
+                       ON CONFLICT(espn_id) DO UPDATE SET name=excluded.name,
+                         league_id=excluded.league_id, updated_at=excluded.updated_at""",
+                    (str(espn_id), name, league_id, time.time()))
+                added += cur.rowcount or 0
+            except Exception:
+                pass
+    await _db.commit()
+    async with _db.execute("SELECT COUNT(*) FROM teams") as cur:
+        total = (await cur.fetchone())[0]
+    logger.info("Team sync: %d teams known", total)
+    return total
+
+
+async def _fetch_crests(limit: int = 400) -> int:
+    """Download and shrink crests for teams that do not have one yet.
+
+    Stored locally rather than hotlinked so the page does not depend on ESPN being up,
+    and resized because the source images are 500px for a badge rendered near 28px.
+    """
+    async with _db.execute(
+        "SELECT espn_id, name FROM teams WHERE has_crest=0 LIMIT ?", (limit,)
+    ) as cur:
+        pending = [(r["espn_id"], r["name"]) for r in await cur.fetchall()]
+    if not pending:
+        return 0
+
+    fetched = 0
+    for espn_id, name in pending:
+        try:
+            resp = await _http_client.get(CREST_URL.format(espn_id=espn_id), timeout=15)
+            if resp.status_code != 200 or not resp.content:
+                continue
+            img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            img.thumbnail((CREST_PX, CREST_PX), Image.LANCZOS)
+            img.save(os.path.join(CREST_DIR, f"{espn_id}.png"), "PNG", optimize=True)
+            await _db.execute("UPDATE teams SET has_crest=1 WHERE espn_id=?", (espn_id,))
+            fetched += 1
+        except Exception as exc:
+            logger.warning("Crest fetch failed for %s (%s): %s", name, espn_id, exc)
+    await _db.commit()
+    if fetched:
+        logger.info("Crests: fetched %d", fetched)
+    return fetched
+
+
+_crest_cache: dict[str, str | None] = {}
+
+
+async def _crest_map() -> dict[str, str]:
+    """Team display name -> crest URL, for teams whose image is on disk."""
+    async with _db.execute(
+        "SELECT name, espn_id FROM teams WHERE has_crest=1"
+    ) as cur:
+        return {r["name"]: f"/crest/{r['espn_id']}" for r in await cur.fetchall()}
+
+
+@app.get("/crest/{espn_id}")
+async def crest(espn_id: str):
+    # Digits only: the id lands in a filesystem path, and this is the whole defence.
+    if not espn_id.isdigit():
+        return Response(status_code=404)
+    path = os.path.join(CREST_DIR, f"{espn_id}.png")
+    if not os.path.exists(path):
+        return Response(status_code=404)
+    with open(path, "rb") as fh:
+        return Response(fh.read(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+# ── Fixture discovery ─────────────────────────────────────────────────────────
+# Scrum asks ESPN "what is in league X?", which structurally cannot find a touring
+# side playing a club side — that fixture belongs to no league. Asking a second source
+# "what is next for team Y?" does find it; that is how the Stormers game surfaced.
+#
+# This is a CHECK, not a data source. It only ever writes to discovered_fixtures and
+# raises a flag for the admin. Nothing here can affect a prediction or a score unless
+# a human presses Add, so if the source goes stale or wrong the cost is a bad
+# suggestion, not a corrupted leaderboard.
+SPORTSDB_KEY = os.environ.get("SPORTSDB_KEY", "3")
+SPORTSDB = f"https://www.thesportsdb.com/api/v1/json/{SPORTSDB_KEY}"
+DISCOVERY_HORIZON_DAYS = 90
+# The free tier returns 429 under a burst, so requests are paced. This runs hourly
+# in the background, so being slow costs nothing.
+SPORTSDB_DELAY = float(os.environ.get("SPORTSDB_DELAY", "1.5"))
+
+
+async def _sportsdb_team_id(name: str) -> str | None:
+    """Resolve a team name to a TheSportsDB id, cached in the teams table.
+
+    National sides are listed as "New Zealand Rugby" or "Japan XV" rather than the bare
+    country, so the suffixes are tried too.
+    """
+    async with _db.execute(
+        "SELECT sportsdb_id FROM teams WHERE name=? AND sportsdb_id IS NOT NULL", (name,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        return row["sportsdb_id"]
+
+    for candidate in (name, f"{name} Rugby", f"{name} XV"):
+        try:
+            resp = await _http_client.get(
+                f"{SPORTSDB}/searchteams.php", params={"t": candidate}, timeout=15)
+            if resp.status_code != 200:
+                continue
+            for team in (resp.json().get("teams") or []):
+                if (team.get("strSport") or "") != "Rugby":
+                    continue
+                tid = team.get("idTeam")
+                await _db.execute("UPDATE teams SET sportsdb_id=? WHERE name=?", (tid, name))
+                await _db.commit()
+                return tid
+        except Exception as exc:
+            logger.warning("SportsDB lookup failed for %s: %s", candidate, exc)
+        await asyncio.sleep(SPORTSDB_DELAY)
+    return None
+
+
+async def _discover_fixtures() -> int:
+    """Flag fixtures a secondary source knows about that Scrum does not. Advisory only."""
+    try:
+        upcoming = await _fetch_espn_upcoming()
+    except Exception as exc:
+        logger.warning("Discovery: upcoming fetch failed: %s", exc)
+        return 0
+
+    # Sources disagree on team names — "Japan Rugby" against "Japan", "Racing Métro 92"
+    # against "Racing 92". Comparing exact keys flagged six fixtures ESPN already had,
+    # and a check that cries wolf every run is one nobody reads. Compare fuzzily, on the
+    # same day, using the matcher the result pipeline already trusts.
+    known_by_day: dict[int, list[tuple[str, str]]] = {}
+    for m in upcoming:
+        day = int((m.get("kickoff_ts") or 0) // 86400)
+        known_by_day.setdefault(day, []).append((m.get("team_home", ""), m.get("team_away", "")))
+
+    def _already_known(home: str, away: str, kts: float) -> bool:
+        day = int(kts // 86400)
+        for offset in (day - 1, day, day + 1):   # kickoffs straddle midnight across zones
+            for kh, ka in known_by_day.get(offset, []):
+                if ((_names_match(home, kh) and _names_match(away, ka)) or
+                        (_names_match(home, ka) and _names_match(away, kh))):
+                    return True
+        return False
+    # Only chase teams we actually follow, so this stays a handful of calls.
+    teams = sorted({t for m in upcoming for t in (m.get("team_home"), m.get("team_away")) if t})
+
+    async with _db.execute("SELECT ext_id FROM discovered_fixtures") as cur:
+        seen = {r["ext_id"] for r in await cur.fetchall()}
+
+    now = time.time()
+    horizon = now + DISCOVERY_HORIZON_DAYS * 86400
+    found = 0
+
+    for name in teams:
+        tid = await _sportsdb_team_id(name)
+        if not tid:
+            continue
+        try:
+            resp = await _http_client.get(f"{SPORTSDB}/eventsnext.php", params={"id": tid}, timeout=15)
+            if resp.status_code == 429:
+                # The free tier throttles. Stop rather than hammer it — whatever was
+                # found this run is kept, and the next run picks up where this left off
+                # because team ids are cached and seen fixtures are recorded.
+                logger.warning("Discovery: rate limited by the source, stopping early "
+                               "after %d team(s)", teams.index(name))
+                break
+            events = (resp.json().get("events") or []) if resp.status_code == 200 else []
+        except Exception:
+            continue
+        await asyncio.sleep(SPORTSDB_DELAY)
+        for ev in events:
+            ext_id = str(ev.get("idEvent") or "")
+            if not ext_id or ext_id in seen:
+                continue
+            kts = _iso_to_ts((ev.get("strTimestamp") or "").replace(" ", "T") + "Z") \
+                if ev.get("strTimestamp") else 0
+            if not kts or kts < now or kts > horizon:
+                continue
+            home = ev.get("strHomeTeam") or ""
+            away = ev.get("strAwayTeam") or ""
+            if _already_known(home, away, kts):
+                continue  # ESPN has it under a different spelling
+            await _db.execute(
+                """INSERT OR IGNORE INTO discovered_fixtures
+                   (ext_id,source,team_home,team_away,kickoff_ts,league,venue,status,seen_at)
+                   VALUES(?,?,?,?,?,?,?,'pending',?)""",
+                (ext_id, "thesportsdb", home, away,
+                 kts, ev.get("strLeague"), ev.get("strVenue"), now))
+            seen.add(ext_id)
+            found += 1
+    await _db.commit()
+    if found:
+        logger.info("Discovery: %d fixture(s) flagged for review", found)
+    return found
+
+
 async def _seed_missing_squads() -> int:
     """Give every team in an upcoming fixture a squad, harvesting from a past match.
 
@@ -1292,6 +1560,8 @@ async def _auto_fetch_loop():
                 logger.info("Auto-fetch: applied %d/%d results", applied, checked)
             await _pre_fetch_squads()
             await _seed_missing_squads()
+            # Cheap once warm: only teams with no crest yet are fetched.
+            await _fetch_crests(limit=40)
         except Exception as exc:
             logger.warning("Auto-fetch loop error: %s", exc)
         await asyncio.sleep(3600)  # every hour
@@ -1306,7 +1576,7 @@ async def _fetch_espn_upcoming() -> list[dict]:
     cached = await _redis.get("espn:upcoming")
     if cached:
         try:
-            return _with_manual_fixtures(json.loads(cached))
+            return _with_manual_fixtures(json.loads(cached), await _db_manual_fixture_rows())
         except Exception:
             pass
     matches = []
@@ -1351,7 +1621,7 @@ async def _fetch_espn_upcoming() -> list[dict]:
             logger.warning("ESPN upcoming fetch error for %s: %s", slug, exc)
     matches.sort(key=lambda x: x["kickoff_ts"])
     await _redis.setex("espn:upcoming", 7200, json.dumps(matches))
-    return _with_manual_fixtures(matches)
+    return _with_manual_fixtures(matches, await _db_manual_fixture_rows())
 
 
 async def _fetch_espn_live() -> list[dict]:
@@ -1442,6 +1712,17 @@ def _get_session_user(request: Request) -> str | None:
 # and a looser one per address to slow a spray across many accounts. The per-address
 # limit is deliberately generous — a household or an office shares one address, and
 # locking out a whole group of mates would be worse than the attack.
+# Team crests are fetched from ESPN by team id, never by name. Matching crests on name
+# attaches Exeter Chiefs' badge to the Super Rugby Chiefs and Bedford Blues' to the
+# Auckland Blues — checked, and both happen. The id comes straight from the fixture feed.
+CREST_DIR = os.environ.get("CREST_DIR", "/data/crests")
+CREST_URL = "https://a.espncdn.com/i/teamlogos/rugby/teams/500/{espn_id}.png"
+CREST_PX = 96  # rendered around 24-32px, so this covers retina without bloating the page
+try:
+    os.makedirs(CREST_DIR, exist_ok=True)
+except OSError:
+    logger.warning("Could not create crest dir %s", CREST_DIR)
+
 INVITE_DEFAULT_DAYS = 30  # shareable group links expire unless told otherwise
 
 LOGIN_WINDOW      = 900   # 15 minutes
@@ -3767,6 +4048,7 @@ async def group_home(request: Request, slug: str):
 .fix-vs{{color:var(--muted);font-weight:400;margin:0 .2rem}}
 .fix-foot{{display:flex;align-items:center;gap:.4rem;flex-shrink:0}}
 @media(max-width:600px){{.fix-row{{flex-direction:column;align-items:stretch;gap:.3rem}}.fix-foot{{justify-content:space-between}}}}
+.fix-crest{{width:20px;height:20px;object-fit:contain;vertical-align:-4px;margin-right:.3rem}}
 .fix-kick{{font-size:.7rem;color:var(--muted);white-space:nowrap}}
 .fix-status{{font-family:'Barlow Condensed',sans-serif;font-size:.65rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:.1rem .35rem;border-radius:3px}}
 .fix-open{{background:rgba(77,158,247,.12);color:var(--accent)}}
@@ -6195,6 +6477,8 @@ async def leaderboard(request: Request, t: str = "all"):
         ) as cur:
             user_pred_slugs = {row["match_id"] for row in await cur.fetchall()}
 
+    crests = await _crest_map()
+
     def _fix_card(m: dict) -> str:
         kts = m["kickoff_ts"]
         th, ta = m["team_home"], m["team_away"]
@@ -6214,7 +6498,14 @@ async def leaderboard(request: Request, t: str = "all"):
             status = f'<a class="fix-status fix-open" href="{pred_url}">Predict</a>'
         else:
             status = f'<a class="fix-status fix-closed" href="{pred_url}">Closed · View predictions</a>'
-        return f'<div class="fix-row"><span class="fix-teams">{_esc(th)} <span class="fix-vs">vs</span> {_esc(ta)}</span><span class="fix-foot">{t_str}{status}</span></div>'
+        ch, ca = crests.get(th), crests.get(ta)
+        # Crests are decorative — the team name is already there, so they carry empty
+        # alt text rather than repeating it to a screen reader.
+        ih = f'<img class="fix-crest" src="{ch}" alt="" loading="lazy">' if ch else ""
+        ia = f'<img class="fix-crest" src="{ca}" alt="" loading="lazy">' if ca else ""
+        return (f'<div class="fix-row"><span class="fix-teams">{ih}{_esc(th)} '
+                f'<span class="fix-vs">vs</span> {ia}{_esc(ta)}</span>'
+                f'<span class="fix-foot">{t_str}{status}</span></div>')
 
     # Count open unpredicted fixtures per tournament for notification badges
     unpredicted: dict[str, int] = {}
@@ -6550,6 +6841,7 @@ async def leaderboard(request: Request, t: str = "all"):
 .fix-vs{{color:var(--muted);font-weight:400;margin:0 .2rem}}
 .fix-foot{{display:flex;align-items:center;gap:.4rem;flex-shrink:0}}
 @media(max-width:600px){{.fix-row{{flex-direction:column;align-items:stretch;gap:.3rem;padding:.45rem .6rem}}.fix-foot{{justify-content:space-between}}}}
+.fix-crest{{width:20px;height:20px;object-fit:contain;vertical-align:-4px;margin-right:.3rem}}
 .fix-kick{{font-size:.7rem;color:var(--muted);white-space:nowrap}}
 .fix-status{{font-family:'Barlow Condensed',sans-serif;font-size:.65rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:.1rem .35rem;border-radius:3px}}
 .lb-toggle-btn{{background:none;border:1px solid var(--border);color:var(--muted);font-family:'Barlow Condensed',sans-serif;font-size:.7rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:.2rem .55rem;border-radius:5px;cursor:pointer}}
@@ -6679,6 +6971,12 @@ async def admin_page(request: Request):
     ) as cur:
         resolved = [dict(r) for r in await cur.fetchall()]
 
+    # Fixtures a second source knows about that we do not. Advisory until accepted.
+    async with _db.execute(
+        "SELECT * FROM discovered_fixtures WHERE status='pending' ORDER BY kickoff_ts"
+    ) as cur:
+        discovered = [dict(r) for r in await cur.fetchall()]
+
     # Auto-fetch status
     laf = _last_auto_fetch
     if laf["ts"]:
@@ -6764,6 +7062,41 @@ async def admin_page(request: Request):
     else:
         pending_html = '<div style="color:var(--muted);font-size:.85rem">No pending matches.</div>'
 
+    # Flagged fixtures. Deliberately loud and deliberately inert: ESPN misses fixtures
+    # that belong to no league, and the only way to notice is a second opinion — but
+    # nothing here touches a prediction until someone chooses.
+    if discovered:
+        cards = ""
+        for d in discovered:
+            when = datetime.fromtimestamp(d["kickoff_ts"], timezone.utc).strftime("%a %d %b %H:%M UTC")
+            opts = "".join(
+                f'<option value="{k}"{" selected" if k == "international" else ""}>{_esc(v)}</option>'
+                for k, v in TOURNAMENTS.items())
+            venue = f' · {_esc(d["venue"])}' if d.get("venue") else ""
+            cards += f"""<div class="disc-card">
+  <div class="disc-main">
+    <div class="disc-teams">{_esc(d['team_home'])} <span class="fix-vs">vs</span> {_esc(d['team_away'])}</div>
+    <div class="disc-meta">{when}{venue} · found in {_esc(d.get('league') or d['source'])}</div>
+  </div>
+  <div class="disc-actions">
+    <form method="post" action="/admin/discover/{_esc(d['ext_id'])}/add" class="disc-add">
+      <select name="tournament" aria-label="Competition to add this fixture to">{opts}</select>
+      <button type="submit" class="btn btn-sm">Add</button>
+    </form>
+    <form method="post" action="/admin/discover/{_esc(d['ext_id'])}/dismiss">
+      <button type="submit" class="btn btn-sm btn-ghost">Dismiss</button>
+    </form>
+  </div>
+</div>"""
+        discovered_section = f"""<div class="admin-section disc-section">
+  <div class="section-title" style="margin-bottom:.35rem">⚠ Possible missing fixtures ({len(discovered)})</div>
+  <div class="disc-intro">Another source lists these for teams you follow, and ESPN does not.
+  Nothing is predictable until you add it.</div>
+  {cards}
+</div>"""
+    else:
+        discovered_section = ""
+
     # Resolved matches
     resolved_html = ""
     for r in resolved:
@@ -6816,6 +7149,14 @@ main{{max-width:780px;margin:2rem auto;padding:0 1.5rem;display:flex;flex-direct
 .create-form input{{width:160px}}
 .admin-check{{display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:var(--muted)}}
 .pending-match{{background:var(--surface2);border:1px solid var(--border);border-radius:6px;margin-bottom:.5rem;overflow:hidden}}
+.disc-section{{border:1.5px solid rgba(245,166,35,.45);background:rgba(245,166,35,.06)}}
+.disc-intro{{font-size:.82rem;color:var(--muted);margin-bottom:.9rem;max-width:60ch}}
+.disc-card{{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.8rem 1rem;margin-bottom:.6rem}}
+.disc-teams{{font-weight:600;font-size:.95rem}}
+.disc-meta{{font-size:.78rem;color:var(--muted);margin-top:.15rem}}
+.disc-actions{{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}}
+.disc-add{{display:flex;align-items:center;gap:.4rem}}
+.disc-add select{{font-size:.8rem;padding:.3rem .4rem;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);max-width:190px}}
 .pending-match summary{{padding:.7rem 1rem;cursor:pointer;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;user-select:none}}
 .pending-match summary:hover{{background:var(--surface)}}
 .pm-title{{font-family:'Barlow Condensed',sans-serif;font-weight:600;flex:1}}
@@ -6848,6 +7189,7 @@ main{{max-width:780px;margin:2rem auto;padding:0 1.5rem;display:flex;flex-direct
     </form>
   </div>
 
+  {discovered_section}
   <div class="admin-section">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
       <div class="section-title" style="margin-bottom:0">Match Results</div>
@@ -6858,6 +7200,12 @@ main{{max-width:780px;margin:2rem auto;padding:0 1.5rem;display:flex;flex-direct
         </form>
         <form method="post" action="/admin/squads/pre-fetch" style="display:inline">
           <button type="submit" class="btn btn-sm btn-ghost">⟳ Fetch Squads</button>
+        </form>
+        <form method="post" action="/admin/crests" style="display:inline">
+          <button type="submit" class="btn btn-sm btn-ghost">⟳ Sync Crests</button>
+        </form>
+        <form method="post" action="/admin/discover" style="display:inline">
+          <button type="submit" class="btn btn-sm btn-ghost">⟳ Check for Missing Fixtures</button>
         </form>
         <form method="post" action="/admin/backfill" style="display:inline"
               onsubmit="return confirm('Score every member\\'s resolved predictions in the groups they belong to? Safe to re-run.')">
@@ -6894,6 +7242,74 @@ async def admin_pre_fetch_squads(request: Request):
     await _pre_fetch_squads()
     await _seed_missing_squads()
     return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/discover")
+async def admin_discover(request: Request):
+    """Run the discovery check now."""
+    username, _ = await _require_admin(request)
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+    found = await _discover_fixtures()
+    return RedirectResponse(url=f"/admin?discovered={found}", status_code=303)
+
+
+@app.post("/admin/discover/{ext_id}/add")
+async def admin_discover_add(request: Request, ext_id: str,
+                             tournament: str = Form(default="international")):
+    """Accept a flagged fixture, making it predictable like any other."""
+    username, _ = await _require_admin(request)
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+    async with _db.execute(
+        "SELECT * FROM discovered_fixtures WHERE ext_id=?", (ext_id,)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return RedirectResponse(url="/admin", status_code=303)
+    d = dict(row)
+    if tournament not in ALL_ESPN_LEAGUES:
+        tournament = "international"
+    # Namespaced so it can never collide with an ESPN numeric event id.
+    match_id = f"disc-{d['source']}-{ext_id}"
+    await _db.execute(
+        """INSERT OR REPLACE INTO manual_fixtures
+           (match_id,tournament,team_home,team_away,kickoff_ts,venue,created_at,created_by)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (match_id, tournament, d["team_home"], d["team_away"], d["kickoff_ts"],
+         d.get("venue"), time.time(), username))
+    await _db.execute(
+        "UPDATE discovered_fixtures SET status='added', decided_at=?, decided_by=? WHERE ext_id=?",
+        (time.time(), username, ext_id))
+    await _db.commit()
+    await _redis.delete("espn:upcoming")  # so it shows immediately
+    logger.info("Discovery accepted by %s: %s vs %s as %s",
+                username, d["team_home"], d["team_away"], tournament)
+    return RedirectResponse(url="/admin?added=1", status_code=303)
+
+
+@app.post("/admin/discover/{ext_id}/dismiss")
+async def admin_discover_dismiss(request: Request, ext_id: str):
+    """Dismiss a flagged fixture so it is not offered again."""
+    username, _ = await _require_admin(request)
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+    await _db.execute(
+        "UPDATE discovered_fixtures SET status='dismissed', decided_at=?, decided_by=? "
+        "WHERE ext_id=?", (time.time(), username, ext_id))
+    await _db.commit()
+    return RedirectResponse(url="/admin?dismissed=1", status_code=303)
+
+
+@app.post("/admin/crests")
+async def admin_crests(request: Request):
+    """Sync the team registry from ESPN and download any crests still missing."""
+    username, _ = await _require_admin(request)
+    if not username:
+        return RedirectResponse(url="/", status_code=303)
+    total = await _sync_teams()
+    fetched = await _fetch_crests()
+    logger.info("Crest sync by %s: %d teams known, %d crests fetched", username, total, fetched)
+    return RedirectResponse(url=f"/admin?crests={fetched}", status_code=303)
 
 
 @app.post("/admin/backfill")

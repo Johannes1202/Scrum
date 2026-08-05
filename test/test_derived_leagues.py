@@ -171,6 +171,67 @@ check("fixture identity ignores home/away order",
       server._fixture_key({"team_home": "New Zealand", "team_away": "Stormers",
                            "kickoff_ts": ts("2026-08-07")}))
 
+# ── Cross-source fixture matching ─────────────────────────────────────────────
+# The discovery check compares a second source against ESPN, and the two disagree on
+# team names. Exact comparison flagged six fixtures ESPN already had on the first live
+# run — a check that cries wolf every time is one nobody reads. These are those exact
+# pairs, as they were actually returned.
+SAME = [
+    ("Japan Rugby",            "Japan"),
+    ("Australia Rugby",        "Australia"),
+    ("Argentina Rugby",        "Argentina"),
+    ("South Africa Rugby",     "South Africa"),
+    ("Canada Rugby",           "Canada"),
+    ("Racing Métro 92",        "Racing 92"),
+    ("Union Bordeaux Bègles",  "Bordeaux Begles"),
+    ("Benetton",               "Benetton Treviso"),
+    ("Sale Sharks",            "Sale Sharks"),
+    ("Bristol Bears",          "Bristol Rugby"),
+    ("New Zealand Rugby",      "New Zealand"),
+    ("All Blacks",             "New Zealand"),
+    ("Springboks",             "South Africa"),
+]
+for a, b in SAME:
+    check(f"{a!r} is recognised as {b!r}", server._names_match(a, b), True)
+
+# It must still tell genuinely different teams apart, or a real missing fixture gets
+# swallowed as a duplicate — the opposite and worse failure.
+DIFFERENT = [
+    ("Sharks XV",   "Stormers"),
+    ("New Zealand", "South Africa"),
+    ("Japan",       "Canada"),
+    ("Leinster",    "Munster"),
+]
+for a, b in DIFFERENT:
+    check(f"{a!r} is NOT confused with {b!r}", server._names_match(a, b), False)
+
+# KNOWN LIMITATION, asserted so it stays known: _names_match is token overlap, so a
+# club sharing a word with another matches on the name alone. It is not tightened here
+# because the same function matches ESPN results to predictions, and a stricter rule
+# would risk unresolved matches — a far worse failure than a duplicate suggestion.
+check("shared-word clubs do match on name alone (limitation)",
+      server._names_match("Exeter Chiefs", "Chiefs"), True)
+check("and again for Blues", server._names_match("Bedford Blues", "Blues"), True)
+
+
+# What protects against that is the PAIR test: dedupe needs BOTH sides to match, so a
+# collision on one name is not enough to suppress a genuinely new fixture.
+def pair_matches(h1, a1, h2, a2):
+    return ((server._names_match(h1, h2) and server._names_match(a1, a2)) or
+            (server._names_match(h1, a2) and server._names_match(a1, h2)))
+
+
+check("same fixture, different spellings, is deduped",
+      pair_matches("Japan Rugby", "Australia Rugby", "Japan", "Australia"), True)
+check("home/away reversed still dedupes",
+      pair_matches("Japan Rugby", "Australia Rugby", "Australia", "Japan"), True)
+check("Exeter Chiefs v Bath is NOT deduped against Chiefs v Crusaders",
+      pair_matches("Exeter Chiefs", "Bath Rugby", "Chiefs", "Crusaders"), False)
+check("Bedford Blues v Ealing is NOT deduped against Blues v Hurricanes",
+      pair_matches("Bedford Blues", "Ealing", "Blues", "Hurricanes"), False)
+check("a genuinely new fixture is not suppressed",
+      pair_matches("Stormers", "New Zealand", "Connacht", "Stormers"), False)
+
 # ── Config-rot guard ──────────────────────────────────────────────────────────
 # Windows are per-edition. Once one fully elapses its fixtures silently revert to
 # the source league, so this fails loudly and asks for the next edition's dates.
