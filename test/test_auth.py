@@ -9,6 +9,7 @@ It has to hold, and it has to fail open rather than lock everyone out.
 import asyncio
 import os
 import sys
+import pathlib
 import tempfile
 import time
 
@@ -159,6 +160,19 @@ async def main():
 
     # ── Cookie hardening ──────────────────────────────────────────────────────
     check("COOKIE_SECURE is configurable", isinstance(server.COOKIE_SECURE, bool), True)
+
+    # ── Invite links ──────────────────────────────────────────────────────────
+    # A shareable link creates an account, so it must expire by default and the
+    # expiry has to be enforced on the POST that acts, not only the GET that renders.
+    check("shareable links expire by default", server.INVITE_DEFAULT_DAYS > 0, True)
+
+    src = pathlib.Path("/app/server.py")
+    if not src.exists():
+        src = pathlib.Path(__file__).parent.parent / "dashboard" / "server.py"
+    text = src.read_text()
+    post_handler = text.split("async def group_join_link_post")[1].split("async def ")[0]
+    check("the POST join path enforces expiry", "expires_at" in post_handler, True)
+    check("the POST join path enforces use count", "max_uses" in post_handler, True)
 
 
 asyncio.run(main())

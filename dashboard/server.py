@@ -1442,6 +1442,8 @@ def _get_session_user(request: Request) -> str | None:
 # and a looser one per address to slow a spray across many accounts. The per-address
 # limit is deliberately generous — a household or an office shares one address, and
 # locking out a whole group of mates would be worse than the attack.
+INVITE_DEFAULT_DAYS = 30  # shareable group links expire unless told otherwise
+
 LOGIN_WINDOW      = 900   # 15 minutes
 LOGIN_MAX_USER    = 8     # failures for one username before it is locked
 LOGIN_MAX_IP      = 40    # failures from one address before it is locked
@@ -3994,7 +3996,10 @@ async def group_invite_link_post(request: Request, slug: str):
         return RedirectResponse(url=f"/groups/{slug}", status_code=303)
     token = secrets.token_urlsafe(24)
     form = await request.form()
-    expiry_days = int(form.get("expiry_days") or 0)
+    # A shareable link lets a stranger create an account, so it gets a life span by
+    # default rather than living forever. 0 still means never, for anyone who wants it.
+    expiry_days = form.get("expiry_days")
+    expiry_days = int(expiry_days) if expiry_days not in (None, "") else INVITE_DEFAULT_DAYS
     expires_at = time.time() + expiry_days * 86400 if expiry_days else None
     await _db.execute(
         """INSERT INTO group_invites
@@ -4184,6 +4189,11 @@ async def group_join_link_post(request: Request, token: str):
     if not inv:
         return HTMLResponse("<h2>Invite link not found.</h2>", status_code=404)
     inv = dict(inv)
+    # Expiry was previously only checked when rendering the page, so posting to an
+    # expired link still joined the group — and on this route that also creates a new
+    # account. The check has to sit on the action, not just the view.
+    if inv.get("expires_at") and time.time() > inv["expires_at"]:
+        return HTMLResponse("<h2>This invite link has expired.</h2>", status_code=410)
     if inv["use_count"] >= inv["max_uses"]:
         return HTMLResponse("<h2>This invite link has been fully used.</h2>", status_code=410)
 
