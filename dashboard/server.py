@@ -1359,6 +1359,9 @@ DISCOVERY_HORIZON_DAYS = 90
 # The free tier returns 429 under a burst, so requests are paced. This runs hourly
 # in the background, so being slow costs nothing.
 SPORTSDB_DELAY = float(os.environ.get("SPORTSDB_DELAY", "1.5"))
+DISCOVERY_INTERVAL = float(os.environ.get("DISCOVERY_INTERVAL", 86400))
+# Starts at 0 so the first pass happens shortly after boot rather than a day later.
+_last_discovery = {"ts": 0.0}
 
 
 async def _sportsdb_team_id(name: str) -> str | None:
@@ -1572,6 +1575,12 @@ async def _auto_fetch_loop():
             await _seed_missing_squads()
             # Cheap once warm: only teams with no crest yet are fetched.
             await _fetch_crests(limit=40)
+            # Fixtures do not appear minute to minute, and the source rate-limits, so
+            # this runs daily rather than hourly. Without it the check would only ever
+            # run when an admin remembered to press the button.
+            if time.time() - _last_discovery["ts"] >= DISCOVERY_INTERVAL:
+                _last_discovery["ts"] = time.time()
+                await _discover_fixtures()
         except Exception as exc:
             logger.warning("Auto-fetch loop error: %s", exc)
         await asyncio.sleep(3600)  # every hour
