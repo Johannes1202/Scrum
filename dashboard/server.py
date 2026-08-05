@@ -1321,6 +1321,16 @@ async def _crest_map() -> dict[str, str]:
         return {r["name"]: f"/crest/{r['espn_id']}" for r in await cur.fetchall()}
 
 
+def _crest_img(crests: dict, team: str, cls: str = "fix-crest") -> str:
+    """Crest markup for a team, or nothing if we have no image for it.
+
+    Decorative: the team name is always rendered alongside, so empty alt text keeps a
+    screen reader from announcing every side twice.
+    """
+    url = crests.get(team)
+    return f'<img class="{cls}" src="{url}" alt="" loading="lazy">' if url else ""
+
+
 @app.get("/crest/{espn_id}")
 async def crest(espn_id: str):
     # Digits only: the id lands in a filesystem path, and this is the whole defence.
@@ -1903,6 +1913,10 @@ _BASE_CSS = """:root{--bg:#f2f7f3;--surface:#ffffff;--surface2:#e8f2ea;--accent:
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Barlow',sans-serif;min-height:100vh}
 a{color:inherit;text-decoration:none}
+.fix-crest{width:20px;height:20px;object-fit:contain;vertical-align:-4px;margin-right:.3rem}
+.nm-crest{width:26px;height:26px;object-fit:contain;vertical-align:-6px;margin-right:.4rem}
+.rec-crest{width:16px;height:16px;object-fit:contain;vertical-align:-3px;margin-right:.25rem}
+.pb-crest{width:28px;height:28px;object-fit:contain;display:block;margin:0 auto .3rem}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .nav-wordmark{height:28px;width:auto;display:block}
@@ -2513,6 +2527,7 @@ async def _winner_streak(username: str, limit: int = 100) -> int:
 @app.get("/me", response_class=HTMLResponse)
 async def me_page(request: Request):
     username = _get_session_user(request)
+    crests = await _crest_map()
     user = await _get_user(username)
     is_admin = user and user["is_admin"]
 
@@ -2870,7 +2885,7 @@ async def me_page(request: Request):
   <div class="section-title">Predict Now</div>
   <a href="{_pred_url(m)}" class="next-match-card">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams">{_esc(m['team_home'])} <span class="nm-vs">vs</span> {_esc(m['team_away'])}</div>
+    <div class="nm-teams">{_crest_img(crests, m['team_home'], 'nm-crest')}{_esc(m['team_home'])} <span class="nm-vs">vs</span> {_crest_img(crests, m['team_away'], 'nm-crest')}{_esc(m['team_away'])}</div>
     <div class="nm-foot">
       <span class="nm-countdown">⏱ {_match_countdown(kts)} to kickoff</span>
       <span class="nm-cta">Predict →</span>
@@ -2886,7 +2901,7 @@ async def me_page(request: Request):
   <div class="section-title">Coming Up</div>
   <div class="next-match-card" style="opacity:.75;cursor:default">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams">{_esc(next_upcoming['team_home'])} <span class="nm-vs">vs</span> {_esc(next_upcoming['team_away'])}</div>
+    <div class="nm-teams">{_crest_img(crests, next_upcoming['team_home'], 'nm-crest')}{_esc(next_upcoming['team_home'])} <span class="nm-vs">vs</span> {_crest_img(crests, next_upcoming['team_away'], 'nm-crest')}{_esc(next_upcoming['team_away'])}</div>
     <div class="nm-foot">
       <span class="nm-countdown">Window opens in {opens_in}</span>
       <span class="nm-cta" style="opacity:.5">Not yet</span>
@@ -2956,7 +2971,7 @@ async def me_page(request: Request):
             exact_tick = ""
         recent_html += f"""<div class="rec-row">
   <div class="rec-main">
-    <div class="rec-match">{_esc(r['team_home'])} vs {_esc(r['team_away'])}</div>
+    <div class="rec-match">{_crest_img(crests, r['team_home'], 'rec-crest')}{_esc(r['team_home'])} vs {_crest_img(crests, r['team_away'], 'rec-crest')}{_esc(r['team_away'])}</div>
     <div class="rec-meta">{_esc(league_name)} · Your pick: {r['score_home']}–{r['score_away']} · Result: {result_txt}{exact_tick}</div>
   </div>
   {pts_badge}
@@ -3307,6 +3322,7 @@ body{{background:#f2f7f3;display:flex;flex-direction:column;align-items:center;j
 @app.get("/h2h/{target}", response_class=HTMLResponse)
 async def h2h_page(request: Request, target: str):
     username = _get_session_user(request)
+    crests = await _crest_map()
     user = await _get_user(username)
     is_admin = bool(user and user["is_admin"])
     target_user = await _get_user(target)
@@ -3377,7 +3393,7 @@ async def h2h_page(request: Request, target: str):
     <div class="h2h-rowpts">{mp} pts</div>
   </div>
   <div class="h2h-match-info">
-    <div class="h2h-match-title">{_esc(m['team_home'])} {m['final_home']}–{m['final_away']} {_esc(m['team_away'])}</div>
+    <div class="h2h-match-title">{_crest_img(crests, m['team_home'], 'rec-crest')}{_esc(m['team_home'])} {m['final_home']}–{m['final_away']} {_crest_img(crests, m['team_away'], 'rec-crest')}{_esc(m['team_away'])}</div>
     <div class="h2h-match-meta">{_esc(league_name)} · {kick_str}</div>
   </div>
   <div class="h2h-cell h2h-cell-r {th_win}">
@@ -3649,6 +3665,7 @@ async def groups_create_post(request: Request):
 @app.get("/groups/{slug}", response_class=HTMLResponse)
 async def group_home(request: Request, slug: str):
     username = _get_session_user(request)
+    crests = await _crest_map()
     user = await _get_user(username)
     is_admin = user and user["is_admin"]
     g = await _get_group(slug)
@@ -3767,7 +3784,8 @@ async def group_home(request: Request, slug: str):
         else:
             status = f'<a class="fix-status fix-closed" href="{pred_url}">View</a>'
         return (f'<div class="fix-row">'
-                f'<span class="fix-teams">{_esc(th)} <span class="fix-vs">vs</span> {_esc(ta)}</span>'
+                f'<span class="fix-teams">{_crest_img(crests, th)}{_esc(th)} '
+                f'<span class="fix-vs">vs</span> {_crest_img(crests, ta)}{_esc(ta)}</span>'
                 f'<span class="fix-foot">{t_str}{status}</span>'
                 f'</div>')
 
@@ -5231,6 +5249,7 @@ async def global_leave(request: Request):
 @app.get("/predict/{slug}", response_class=HTMLResponse)
 async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", kts: float = 0, title: str = "", tournament: str = "", group: str = ""):
     username = _get_session_user(request)
+    crests = await _crest_map()
     if not username:
         return RedirectResponse(url="/login", status_code=303)
     user = await _get_user(username)
@@ -5383,11 +5402,11 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
         form_html = f"""<div class="pred-box pred-done">
   <div class="pb-label">Your Prediction</div>
   <div class="pb-score">
-    <div class="pb-team">{_esc(team_home)}</div>
+    <div class="pb-team">{_crest_img(crests, team_home, 'pb-crest')}{_esc(team_home)}</div>
     <div class="pb-num">{my_pred['score_home']}</div>
     <div class="pb-dash">—</div>
     <div class="pb-num">{my_pred['score_away']}</div>
-    <div class="pb-team">{_esc(team_away)}</div>
+    <div class="pb-team">{_crest_img(crests, team_away, 'pb-crest')}{_esc(team_away)}</div>
   </div>
   {''.join(f'<div class="pred-summary-row"><span class="psr-label">{PRED_LABEL.get(k,"")}</span><span class="psr-val">{_esc(str(v))}</span></div>' for k,v in [("winner",my_pred.get("pred_winner")),("margin",my_pred.get("pred_margin")),("btts","Yes" if my_pred.get("pred_btts")==1 else ("No" if my_pred.get("pred_btts")==0 else None)),("try_anytime",my_pred.get("pred_try_any")),("try_first",my_pred.get("pred_try_first"))] if v)}
   <div style="font-size:.8rem;color:var(--muted);margin-top:.5rem">Locked — predictions cannot be changed.</div>
@@ -5414,13 +5433,13 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
     <input type="hidden" name="tournament" value="{_esc(tournament)}">
     <div class="pef-label" style="margin-bottom:.4rem">Score</div>
     <div class="pb-score" style="margin:.5rem 0 1rem">
-      <div class="pb-team">{_esc(team_home)}</div>
+      <div class="pb-team">{_crest_img(crests, team_home, 'pb-crest')}{_esc(team_home)}</div>
       <input type="number" name="score_home" min="0" max="200" placeholder="0" required
              style="width:60px;text-align:center;font-size:1.2rem">
       <div class="pb-dash">—</div>
       <input type="number" name="score_away" min="0" max="200" placeholder="0" required
              style="width:60px;text-align:center;font-size:1.2rem">
-      <div class="pb-team">{_esc(team_away)}</div>
+      <div class="pb-team">{_crest_img(crests, team_away, 'pb-crest')}{_esc(team_away)}</div>
     </div>
     {extra_fields}
     <label class="banker-toggle">
@@ -6207,6 +6226,7 @@ async def how_to_play(request: Request):
 @app.get("/history", response_class=HTMLResponse)
 async def history_page(request: Request, t: str = "all"):
     username = _get_session_user(request)
+    crests = await _crest_map()
     user = await _get_user(username)
     is_admin = bool(user and user["is_admin"])
 
@@ -6308,7 +6328,8 @@ async def history_page(request: Request, t: str = "all"):
             f'<div class="hist-match-row" onclick="toggleHistMatch(this)">'
             f'<div class="hmr-main">'
             f'<span class="hmr-date">{dt}</span>'
-            f'<span class="hmr-title">{_esc(m["match_title"])}</span>'
+            f'<span class="hmr-title">{_crest_img(crests, m["team_home"], "rec-crest")}{_esc(m["team_home"])}'
+            f' <span class="fix-vs">v</span> {_crest_img(crests, m["team_away"], "rec-crest")}{_esc(m["team_away"])}</span>'
             f'<span class="hmr-score">{m["final_home"]}—{m["final_away"]}</span>'
             f'<span class="hmr-league">{_esc(league_name)}</span>'
             f'<span class="hmr-chevron material-symbols-outlined">expand_more</span>'
