@@ -1430,11 +1430,13 @@ async def _discover_fixtures() -> int:
     now = time.time()
     horizon = now + DISCOVERY_HORIZON_DAYS * 86400
     found = 0
+    resolved = 0
 
     for name in teams:
         tid = await _sportsdb_team_id(name)
         if not tid:
             continue
+        resolved += 1
         try:
             resp = await _http_client.get(f"{SPORTSDB}/eventsnext.php", params={"id": tid}, timeout=15)
             if resp.status_code == 429:
@@ -1469,8 +1471,10 @@ async def _discover_fixtures() -> int:
             seen.add(ext_id)
             found += 1
     await _db.commit()
-    if found:
-        logger.info("Discovery: %d fixture(s) flagged for review", found)
+    # Always report, including a clean run. A check that only speaks when it finds
+    # something is indistinguishable from one that has quietly stopped working.
+    logger.info("Discovery: checked %d team(s), %d resolved to a source, %d new fixture(s) flagged",
+                len(teams), resolved, found)
     return found
 
 
@@ -1498,6 +1502,24 @@ async def _seed_missing_squads() -> int:
         ) as cur:
             if not await cur.fetchone():
                 missing.add(team)
+
+    # Some teams have no ESPN roster anywhere — minor nations and second-tier clubs
+    # that appear as an opponent but play in no league we follow. Without a memory of
+    # that, every hour re-ran a 150-day results scan across every league to look for
+    # squads that will never arrive. Failures are remembered for a week.
+    if missing and _redis:
+        try:
+            still = set()
+            for team in missing:
+                if not await _redis.get(f"squadseed:nohope:{team}"):
+                    still.add(team)
+            skipped = len(missing) - len(still)
+            if skipped:
+                logger.debug("Seed squads: skipping %d team(s) with no known source", skipped)
+            missing = still
+        except Exception as exc:
+            logger.warning("Seed squads: backoff check failed: %s", exc)
+
     if not missing:
         return 0
 
@@ -1512,6 +1534,7 @@ async def _seed_missing_squads() -> int:
     past.sort(key=lambda r: r.get("event_ts") or 0, reverse=True)
     seeded = 0
     for team in sorted(missing):
+        found = False
         for r in past:
             if team not in (r.get("team_home"), r.get("team_away")):
                 continue
@@ -1522,7 +1545,16 @@ async def _seed_missing_squads() -> int:
                 logger.info("Seed squads: %s seeded from event %s (%d players)",
                             team, r["espn_id"], stored)
                 seeded += 1
+                found = True
                 break
+        if not found and _redis:
+            # Nothing to harvest from. Remember for a week rather than rescanning every
+            # hour; a week is short enough that a team joining a followed league is
+            # picked up on its own.
+            try:
+                await _redis.setex(f"squadseed:nohope:{team}", 604800, "1")
+            except Exception:
+                pass
     return seeded
 
 
