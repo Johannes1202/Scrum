@@ -4,12 +4,12 @@
 
 <p align="center">
   A self-hosted rugby companion app with a prediction league built in.<br>
-  Live fixtures, match results, standings and squad data across 11 competitions —<br>
+  Live fixtures, match results, standings and squad data across 15 competitions —<br>
   plus a full prediction game to play with your mates.
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#how-auto-resolution-works">Auto-Resolution</a> · <a href="#configuration">Configuration</a>
+  <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#how-auto-resolution-works">Auto-Resolution</a> · <a href="#configuration">Configuration</a> · <a href="#tests">Tests</a>
 </p>
 
 ---
@@ -23,24 +23,37 @@
 ## Features
 
 ### As a rugby companion
-- Fixtures across 11 competitions — Nations Championship, Super Rugby Pacific, URC, Six Nations, Rugby Championship, Premiership, Top 14, Champions Cup, Challenge Cup, World Cup, International
+- Fixtures across 15 competitions, with team crests throughout
 - Full match breakdowns — try scorers grouped by team with minute stamps, first try scorer
-- League standings updated from ESPN
-- Pre-match squad data updated 48–72h before kickoff
+- League standings from ESPN
+- Squad data pulled before kickoff, so try-scorer picks come from a real team list
 - Rugby news feed
 
 ### As a prediction league
 - 6 prediction types: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer
-- Banker pick — mark one prediction per week to double your points
-- Private groups with custom league subscriptions and prediction type sets
-- Fully auto-resolved from ESPN — no manual data entry, no API keys
-- Group leaderboards, personal accuracy stats, head-to-head, hot streak, shareable profile cards
+- Banker pick — one per round, doubles your points for that match
+- Private groups, each choosing its own competitions and prediction types
+- **Global league is opt-in** — compete server-wide only if you want to; otherwise only your own groups count, toward both leaderboards and your profile
+- Group leaderboards, accuracy by prediction type, head-to-head, streaks, shareable profile cards
+- Joining a group backfills your already-resolved predictions, so you don't arrive with a blank record
+
+### Seasons
+Matches carry a season label — split-year for northern club competitions (`2026-27`), calendar year for everything else — so next season never piles onto this one. Archiving a season moves a group's boundary forward rather than deleting rows, keeping last season inspectable match by match.
+
+### Derived leagues
+ESPN files trophy series under a generic "International" league with no metadata to tell them apart, so Scrum declares them: an exact team pairing plus a kickoff window over a source league. That splits out **Rugby's Greatest Rivalry**, the **Puma Trophy**, the **Mandela Challenge Plate** and the **Bledisloe Cup** as competitions in their own right, leaving International as genuine miscellany.
+
+### Fixtures ESPN doesn't have
+A touring side playing a club side belongs to no league, so a league-indexed lookup structurally cannot find it. Two things cover that:
+
+- **Manual fixtures** — declare a fixture in config or accept one from the admin panel. If ESPN later publishes it, the real event wins, matched on teams and date.
+- **Discovery check** — asks a secondary source *"what's next for the teams we follow?"* and flags anything Scrum doesn't have, with **Add** and **Dismiss** on the admin page. It's a check, not a data source: it never writes match data, so a stale or wrong source costs you a bad suggestion, not a corrupted leaderboard.
 
 ### Self-hosted friendly
 - One `docker compose up --build -d` and it's running
-- No email server — password resets via admin-generated magic links (share on WhatsApp)
-- No API keys — everything comes from ESPN's free public endpoints
-- All data stays on your server
+- No email server — password resets via admin-generated magic links
+- No API keys required — everything comes from ESPN's free public endpoints
+- Login rate limiting, expiring invite links, all data on your own server
 
 ---
 
@@ -66,21 +79,7 @@ docker compose up --build -d
 
 Open `http://localhost:8888`. Log in, create a group, invite your mates.
 
-> **Always use `docker compose up --build -d` when updating** — `docker compose restart` uses the old image.
-
----
-
-## Screenshots
-
-| | |
-|---|---|
-| ![Groups](screenshots/groups.png) | ![Predict](screenshots/predict.png) |
-| **Groups** — per-league collapsible sections with fixtures, standings, awaiting and recent results | **Predict** — upcoming fixtures across competitions with prediction status |
-
-| | |
-|---|---|
-| ![Me](screenshots/me.png) | ![News](screenshots/news.png) |
-| **Me** — personal stats, prediction accuracy by type, hot streak, upcoming fixtures | **News** — live rugby news feed |
+> **Always use `docker compose up --build -d` when updating** — `docker compose restart` reuses the old image.
 
 ---
 
@@ -88,10 +87,28 @@ Open `http://localhost:8888`. Log in, create a group, invite your mates.
 
 After the final whistle, Scrum:
 
-1. **Fetches the result from ESPN** and scores all groups immediately
-2. **Pulls try scorer data** from ESPN match summaries — each try has the scorer's name, team, and minute, so anytime and first-try-scorer predictions resolve automatically
+1. **Fetches the result from ESPN** and scores every group immediately
+2. **Pulls try scorer data** from ESPN match summaries — each try carries the scorer, team and minute, so anytime and first-try predictions resolve on a second pass
 
-Every prediction type is resolved from ESPN — there's nothing to enter by hand. The admin panel is there to correct a wrong result if you ever need to; it re-scores every group automatically.
+For anything ESPN covers — which is every league competition and every Test — there is nothing to enter by hand.
+
+**The exception worth knowing about:** ESPN does not carry every fixture. Touring matches against club sides are the known case, and for those the result has to be entered from the admin panel, including try scorers. That form takes the score and a comma-separated list of scorers, stored in exactly the shape ESPN produces, so scoring can't tell the difference. Rare, but real — plan for it if your competitions include tours.
+
+Result correction re-scores every group automatically.
+
+---
+
+## Tests
+
+```bash
+./test/all.sh
+```
+
+Runs inside the app container, no extra dependencies. Covers the scoring engine
+(every prediction type, banker doubling, two-pass idempotency, type-coercion
+regressions), derived-league filters, season labelling, Global opt-in and
+per-match deduplication, backfill-on-join, login throttling and session tokens,
+plus a live check against the real ESPN feed.
 
 ---
 
@@ -105,6 +122,13 @@ Every prediction type is resolved from ESPN — there's nothing to enter by hand
 | `REDIS_URL` | `redis://redis:6379` | Redis connection (leave as-is with docker-compose) |
 | `DB_PATH` | `/data/scrum.db` | SQLite database path |
 | `PORT` | `8888` | Port to expose |
+| `COOKIE_SECURE` | off | Set to `1` to mark session cookies Secure. Only enable if you reach the app **exclusively** over HTTPS — it breaks plain-HTTP and LAN access |
+| `RESULTS_FLOOR` | `2026-07-04` | Results before this date are not stored. The companion backfill reaches 45 days into the past, so without a floor it refills history you deliberately cleared |
+| `AVATAR_DIR` | `/data/avatars` | Where profile pictures live |
+| `CREST_DIR` | `/data/crests` | Where team crests are cached |
+| `SPORTSDB_KEY` | `3` | Key for the discovery check's secondary source. `3` is the free development key |
+| `SPORTSDB_DELAY` | `1.5` | Seconds between secondary-source requests — the free tier rate-limits |
+| `DISCOVERY_INTERVAL` | `86400` | Seconds between discovery runs |
 
 ---
 
@@ -121,23 +145,34 @@ Database migrations run automatically on startup.
 
 ## Exposing publicly
 
-Works great behind Nginx or Cloudflare Tunnel.
+Works behind Nginx or a Cloudflare Tunnel.
 
 ```nginx
 location / {
     proxy_pass http://localhost:8888;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
+
+Login rate limiting reads the client address from `CF-Connecting-IP`, then
+`X-Forwarded-For`, then the socket. **Forward one of those headers** — behind a
+tunnel every request otherwise appears to come from the tunnel itself, and a
+single shared counter would throttle all your players at once.
 
 ---
 
 ## Competitions
 
-Nations Championship · Super Rugby Pacific · URC · Six Nations · Rugby Championship · Premiership · Top 14 · Champions Cup · Challenge Cup · Rugby World Cup · International
+Nations Championship · Super Rugby Pacific · URC · Six Nations · Premiership · Top 14 ·
+Champions Cup · Challenge Cup · Rugby World Cup · International · Rugby's Greatest Rivalry ·
+Puma Trophy · Mandela Challenge Plate · Bledisloe Cup
 
-Fixtures, results, standings and squad data pulled from ESPN. No API key required.
+The Rugby Championship is configured but dormant — SANZAAR dropped it for 2026 and 2030;
+it returns in 2027.
+
+Fixtures, results, standings, squads and crests come from ESPN. No API key required.
 
 ---
 
