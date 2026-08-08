@@ -3026,9 +3026,9 @@ async def me_page(request: Request):
         recent_html += f"""<div class="rec-row">
   <div class="rec-main">
     <div class="rec-match vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(r['team_home'])}</span>{_crest_img(crests, r['team_home'], 'rec-crest')}</span><span class="vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, r['team_away'], 'rec-crest')}<span class="vs-name">{_esc(r['team_away'])}</span></span></div>
-    <div class="rec-meta">{_esc(league_name)} · Your pick: {r['score_home']}–{r['score_away']} · Result: {result_txt}{exact_tick}</div>
+    <div class="rec-meta"><span class="rm-league">{_esc(league_name)}</span><span class="rm-result">{result_txt}{exact_tick}</span></div>
+    <div class="rec-foot"><span class="rm-pick">Your pick: {r['score_home']}–{r['score_away']}</span>{pts_badge}</div>
   </div>
-  {pts_badge}
 </div>"""
 
     # Pending invites section
@@ -3085,9 +3085,14 @@ async def me_page(request: Request):
 .role-pill{{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--accent3);border:1px solid var(--accent3);border-radius:4px;padding:.05rem .3rem;margin-left:.35rem;vertical-align:middle}}
 .rec-row{{display:flex;align-items:center;justify-content:space-between;padding:.7rem 0;border-bottom:1px solid var(--border)}}
 .rec-row:last-child{{border-bottom:none}}
-.rec-main{{flex:1;min-width:0;padding-right:.75rem}}
+.rec-main{{flex:1;min-width:0}}
 .rec-match{{font-size:.9rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.rec-meta{{font-size:.75rem;color:var(--muted);margin-top:.15rem}}
+.rec-meta{{font-size:.75rem;color:var(--muted);margin-top:.2rem;display:flex;align-items:baseline;column-gap:.5rem}}
+.rec-foot{{font-size:.75rem;color:var(--muted);margin-top:.15rem;display:flex;align-items:center;column-gap:.5rem}}
+.rm-league{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.rm-result{{margin-left:auto;flex-shrink:0;font-weight:600;color:var(--text)}}
+.rm-pick{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.rec-foot .rec-pts{{margin-left:auto}}
 .rec-pts{{font-family:'Barlow Condensed',sans-serif;font-size:.9rem;font-weight:700;letter-spacing:.04em;padding:.25rem .55rem;border-radius:6px;flex-shrink:0}}
 .pts-5{{background:rgba(34,197,94,.15);color:#22c55e}}
 .pts-3{{background:rgba(77,158,247,.12);color:var(--accent)}}
@@ -6427,6 +6432,10 @@ async def history_page(request: Request, t: str = "all"):
 .hmr-league{{font-size:.68rem;color:var(--muted);font-family:'Barlow Condensed',sans-serif;letter-spacing:.05em;text-transform:uppercase;flex-shrink:0;display:none}}
 @media(min-width:500px){{.hmr-league{{display:block}}}}
 .hmr-chevron{{color:var(--muted);font-size:.95rem;transition:transform .2s;flex-shrink:0}}
+@media(min-width:601px){{
+  .hmr-score{{min-width:74px;text-align:right}}
+  .hmr-league{{min-width:152px}}
+}}
 .hist-match-row.open .hmr-chevron{{transform:rotate(180deg)}}
 /* Narrow screens: give the matchup the whole first line and drop the date and score
    to a second, the way .fix-row already does. One line could not hold a date, two club
@@ -6440,7 +6449,8 @@ async def history_page(request: Request, t: str = "all"):
   .hmr-title{{order:1;flex:0 0 100%}}
   .hmr-date{{order:2}}
   .hmr-league{{order:3;display:block}}
-  .hmr-score{{order:4;margin-left:auto}}
+  .hmr-league{{margin-left:auto;margin-right:auto}}
+  .hmr-score{{order:4}}
   .hmr-chevron{{order:5}}
 }}
 .hmr-body{{display:none;border-top:1px solid var(--border);padding:.75rem .85rem}}
