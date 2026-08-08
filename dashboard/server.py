@@ -3087,12 +3087,18 @@ async def me_page(request: Request):
 .rec-row:last-child{{border-bottom:none}}
 .rec-main{{flex:1;min-width:0}}
 .rec-match{{font-size:.9rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.rec-meta{{font-size:.75rem;color:var(--muted);margin-top:.2rem;display:flex;align-items:baseline;column-gap:.5rem}}
+.rec-meta{{font-size:.75rem;color:var(--muted);margin-top:.2rem;display:flex;align-items:center;column-gap:.5rem}}
 .rec-foot{{font-size:.75rem;color:var(--muted);margin-top:.15rem;display:flex;align-items:center;column-gap:.5rem}}
 .rm-league{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.rm-result{{margin-left:auto;flex-shrink:0;font-weight:600;color:var(--text)}}
 .rm-pick{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.rec-foot .rec-pts{{margin-left:auto}}
+.rec-match .vs-name{{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}}
+.rec-match .vs-side{{align-items:center}}
+/* Result and points read as one right-hand column: same type, same box, same edges.
+   Equal min-width and matching padding put their left and right edges on the same x. */
+.rm-result,.rec-foot .rec-pts{{margin-left:auto;flex-shrink:0;min-width:62px;text-align:right;
+  font-family:'Barlow Condensed',sans-serif;font-size:.9rem;font-weight:700;letter-spacing:.04em;
+  padding:.25rem .55rem}}
+.rm-result{{color:var(--text)}}
 .rec-pts{{font-family:'Barlow Condensed',sans-serif;font-size:.9rem;font-weight:700;letter-spacing:.04em;padding:.25rem .55rem;border-radius:6px;flex-shrink:0}}
 .pts-5{{background:rgba(34,197,94,.15);color:#22c55e}}
 .pts-3{{background:rgba(77,158,247,.12);color:var(--accent)}}
