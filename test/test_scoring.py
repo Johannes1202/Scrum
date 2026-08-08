@@ -448,6 +448,12 @@ async def main():
     check("a week later is a new bucket", wk(KICKOFF) == wk(KICKOFF + 604800), False)
     check("bucket is 7 days wide", wk(KICKOFF + 604800) - wk(KICKOFF), 604800.0)
 
+    # aiosqlite's worker thread is non-daemon, so leaving the connection open kept the
+    # interpreter alive in threading._shutdown long after sys.exit(0). all.sh then blocked
+    # on this suite forever and test_auth + test_live_espn never ran at all — while every
+    # line it printed said "0 failed". Closing it is what lets the process exit.
+    await server._db.close()
+
 
 asyncio.run(main())
 

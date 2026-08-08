@@ -2007,6 +2007,10 @@ input:focus,select:focus{border-color:var(--header)}
 .banker-icon{font-size:1.2rem}
 .pred-extra-field{margin:.75rem 0}
 .pef-label{font-size:.78rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin-bottom:.4rem}
+.pef-worth{font-size:.68rem;font-weight:600;letter-spacing:.04em;color:var(--muted);opacity:.75;text-transform:none}
+select.pef-select.pef-unset{border-color:#f5a623;background:rgba(245,166,35,.06)}
+.pef-hint{display:none;font-size:.72rem;color:#c77b00;margin-top:.3rem}
+select.pef-select.pef-unset+.pef-hint{display:block}
 .pef-opts{display:flex;gap:1rem;flex-wrap:wrap}
 .radio-opt{display:flex;align-items:center;gap:.4rem;font-size:.9rem;cursor:pointer}
 .radio-opt input[type=radio]{accent-color:var(--accent3)}
@@ -5413,8 +5417,9 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
             sel = " selected" if band == cur_m else ""
             margin_opts += f'<option value="{band}"{sel}>{band} pts</option>'
         extra_fields += f"""<div class="pred-extra-field">
-  <div class="pef-label">Winning Margin</div>
-  <select name="pred_margin" style="width:100%"><option value="">— Select band —</option>{margin_opts}</select>
+  <div class="pef-label">Winning Margin <span class="pef-worth">2 pts</span></div>
+  <select name="pred_margin" id="pred-margin-sel" class="pef-select{" pef-unset" if not cur_m else ""}" style="width:100%"><option value="">— No band picked —</option>{margin_opts}</select>
+  <div class="pef-hint">No band picked — margin will score 0 of a possible 2.</div>
 </div>"""
     if "btts" in active_pred_types:
         cur_b = (my_pred or {}).get("pred_btts")
@@ -5497,8 +5502,17 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
   </form>
 </div>
 <script>
+const mSel=document.getElementById('pred-margin-sel');
+if(mSel){{mSel.addEventListener('change',function(){{
+  mSel.classList.toggle('pef-unset',!mSel.value);
+}});}}
 document.getElementById('pred-form').addEventListener('submit',async function(e){{
   e.preventDefault();
+  if(mSel&&!mSel.value&&!mSel.dataset.nudged){{
+    mSel.dataset.nudged='1';
+    mSel.scrollIntoView({{block:'center',behavior:'smooth'}});
+    if(!confirm("You haven't picked a winning margin band \u2014 that's 2 points. Lock in without it?")){{return;}}
+  }}
   const btn=this.querySelector('button[type=submit]');
   btn.disabled=true; btn.textContent='Saving…';
   const fd=new FormData(this);
@@ -7019,7 +7033,7 @@ async def admin_page(request: Request):
 
     async with _db.execute(
         """SELECT p.match_id, p.match_title, p.team_home, p.team_away, p.kickoff_ts,
-                  COUNT(p.id) as pred_count
+                  p.tournament, COUNT(p.id) as pred_count
            FROM predictions p
            LEFT JOIN match_results r ON p.match_id = r.match_id
            WHERE r.match_id IS NULL
@@ -7067,8 +7081,17 @@ async def admin_page(request: Request):
     # Pending matches section
     pending_html = ""
     if pending:
-        t_options = "".join(f'<option value="{k}">{v}</option>' for k, v in TOURNAMENTS.items())
         for m in pending:
+            # Built per match so the match's own competition is pre-selected. Built once
+            # outside this loop it had no `selected` at all, so every pending match opened
+            # on the first entry in TOURNAMENTS (Nations Championship). The value goes
+            # straight into _score_group() and _season_for(), so an unchanged dropdown
+            # silently misfiled the match onto the wrong Results tab and could stop the
+            # right group scoring it. Bit nobody only because the tour matches were
+            # entered via the API; the correction form was always fine (hidden input).
+            t_options = "".join(
+                f'<option value="{k}"{" selected" if k == (m.get("tournament") or "") else ""}>{v}</option>'
+                for k, v in TOURNAMENTS.items())
             dt = datetime.fromtimestamp(m["kickoff_ts"], tz=timezone.utc).strftime("%d %b %Y %H:%M") if m["kickoff_ts"] else "Unknown"
             pending_html += f"""<details class="pending-match">
   <summary>

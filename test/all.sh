@@ -27,8 +27,15 @@ docker cp "$(dirname "$0")" "$CONTAINER:/app/test" >/dev/null || {
 
 for suite in test_derived_leagues test_scoring test_auth test_live_espn; do
     echo "── $suite ──────────────────────────────────────────"
-    if docker exec "$CONTAINER" python3 "/app/test/$suite.py"; then
+    # Hard cap per suite. A suite that hangs used to block the loop forever, so the
+    # suites after it never ran and the run still read as green. A hang is now a FAIL.
+    docker exec "$CONTAINER" timeout "${SUITE_TIMEOUT:-120}" python3 "/app/test/$suite.py"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
         RESULTS+=("  PASS  $suite")
+    elif [ "$rc" -eq 124 ]; then
+        RESULTS+=("  FAIL  $suite (timed out after ${SUITE_TIMEOUT:-120}s)")
+        FAILED=1
     else
         RESULTS+=("  FAIL  $suite")
         FAILED=1
