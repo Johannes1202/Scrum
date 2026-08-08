@@ -166,6 +166,16 @@ async def main():
     # expiry has to be enforced on the POST that acts, not only the GET that renders.
     check("shareable links expire by default", server.INVITE_DEFAULT_DAYS > 0, True)
 
+    # Renaming a competition is group-admin only, and scoped by group_id so it cannot
+    # be driven from another group's URL — the same guard delete and matches use.
+    src0 = pathlib.Path("/app/server.py")
+    if not src0.exists():
+        src0 = pathlib.Path(__file__).parent.parent / "dashboard" / "server.py"
+    rn = src0.read_text().split("async def group_competition_rename")[1].split("async def ")[0]
+    check("rename checks group-admin role", 'role != "admin"' in rn, True)
+    check("rename is scoped by group_id", "AND group_id=?" in rn, True)
+    check("rename rejects an empty name", "if not name:" in rn, True)
+
     src = pathlib.Path("/app/server.py")
     if not src.exists():
         src = pathlib.Path(__file__).parent.parent / "dashboard" / "server.py"

@@ -4820,6 +4820,10 @@ async def group_competitions_get(request: Request, slug: str):
     <div style="font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:1rem;letter-spacing:.03em">★ {_esc(cc['name'])}</div>
     <div style="display:flex;gap:.4rem">
       <a href="/groups/{_esc(slug)}/competitions/{cc['id']}/matches" class="btn btn-sm btn-ghost">Edit Matches</a>
+      <form method="post" action="/groups/{_esc(slug)}/competitions/{cc['id']}/rename" style="display:inline" onsubmit="var n=prompt('Rename this competition', {json.dumps(cc['name'])}); if(n===null||!n.trim()){{return false;}} this.name.value=n.trim(); return true;">
+        <input type="hidden" name="name" value="{_esc(cc['name'])}">
+        <button class="btn btn-sm btn-ghost" type="submit">Rename</button>
+      </form>
       <form method="post" action="/groups/{_esc(slug)}/competitions/{cc['id']}/delete" style="display:inline" onsubmit="return confirm({json.dumps('Delete ' + cc['name'] + '?')})">
         <button class="btn btn-sm btn-danger" type="submit">Delete</button>
       </form>
@@ -4881,6 +4885,30 @@ async def group_competitions_post(request: Request, slug: str):
     except Exception:
         pass
     return RedirectResponse(url=f"/groups/{slug}/competitions?created=1", status_code=303)
+
+
+@app.post("/groups/{slug}/competitions/{comp_id}/rename", response_class=HTMLResponse)
+async def group_competition_rename(request: Request, slug: str, comp_id: int):
+    username = _get_session_user(request)
+    g = await _get_group(slug)
+    if not g:
+        return HTMLResponse("<h2>Group not found</h2>", status_code=404)
+    role = await _group_member_role(g["id"], username)
+    if role != "admin":
+        return RedirectResponse(url=f"/groups/{slug}", status_code=303)
+    form = await request.form()
+    name = (form.get("name") or "").strip()[:60]
+    if not name:
+        return RedirectResponse(url=f"/groups/{slug}/competitions", status_code=303)
+    comp_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:50]
+    # Scoped by group_id as well as id so a competition cannot be renamed from another
+    # group's URL, the same guard the delete and matches routes use.
+    await _db.execute(
+        "UPDATE custom_competitions SET name=?, slug=? WHERE id=? AND group_id=?",
+        (name, comp_slug, comp_id, g["id"]),
+    )
+    await _db.commit()
+    return RedirectResponse(url=f"/groups/{slug}/competitions", status_code=303)
 
 
 @app.post("/groups/{slug}/competitions/{comp_id}/delete", response_class=HTMLResponse)
