@@ -6426,8 +6426,9 @@ async def how_to_play(request: Request):
     <div class="admin-label">Admin Guide</div>
     <h2>Creating a Group</h2>
     <p>Go to <strong>Groups → Create Group</strong>. Give it a name, pick which competitions to follow, and choose which prediction types your group will compete on.</p>
-    <p>Every prediction type is <span class="badge-auto">Auto-resolved</span> — the result is fetched automatically from ESPN after the match, so there's nothing to enter by hand.</p>
-    <p>You can change leagues and prediction types any time from <strong>Group → Settings</strong>.</p>
+    <p>Almost everything is <span class="badge-auto">Auto-resolved</span> — the result is fetched from ESPN after the match, try scorers included, so there's normally nothing to enter by hand.</p>
+    <p><strong>The exception is a touring side playing a club side.</strong> Those fixtures belong to no league, so ESPN doesn't carry them and no result will ever arrive on its own. An admin enters the score <em>and</em> the try scorers from the Admin panel. Enter only the score and every anytime-try and first-try pick on that match silently scores zero — 7 of the 17 points a match is worth.</p>
+    <p>You can change the group's name, description, competitions and scoring rules any time from <strong>Group → Settings</strong>.</p>
 
     <h2>Inviting People</h2>
     <p>From your group, tap <strong>Invite People</strong>. There are two ways:</p>
@@ -6501,7 +6502,7 @@ async def how_to_play(request: Request):
     <h2>Making Predictions</h2>
     <p>Tap any upcoming fixture and tap <strong>Predict</strong>. You'll see the prediction types your group has enabled. Fill in what you know, leave the rest — only the types you submit count toward your score.</p>
     <p><strong>Prediction window:</strong> opens 48 hours before kickoff and closes at kickoff. Once the match starts, no more predictions are accepted. Predictions are locked once submitted and cannot be changed.</p>
-    <p>Your prediction applies to every group you're in that follows that competition.</p>
+    <p>Your prediction applies to every group you're in that follows that competition — you only enter it once. The <strong>banker</strong> is the exception: that's chosen per group, on the same form.</p>
   </div>
 
   <div class="htp-section">
@@ -6546,8 +6547,10 @@ async def how_to_play(request: Request):
 
   <div class="htp-section">
     <h2>Banker Pick</h2>
-    <p>Once per week you can mark one prediction as your <strong>Banker</strong>. If you earn any points on that match, they're doubled. If you score zero, nothing happens — no penalty.</p>
-    <p>The banker toggle appears at the bottom of the prediction form. You can only have one banker active per week — marking a new one automatically clears the previous week's banker if it's still in the same 7-day window.</p>
+    <p>Once a week <strong>in each group</strong> you can mark one prediction as your <strong>Banker</strong>. If you earn any points on that match they're doubled. Score zero and nothing happens — there's no penalty.</p>
+    <p><strong>The banker is chosen per group.</strong> At the bottom of the prediction form you'll see a box for each of your groups that uses bankers, so the same prediction can be your banker in one league and an ordinary pick in another. Picking a new banker later in the same week moves it within that group only — the others are untouched.</p>
+    <p><strong>Once the match you banked has kicked off, that group's banker is spent for the week.</strong> You can't move it to a later fixture after seeing how the first one went. If you try, the prediction still saves — you just won't get the banker on it, and it'll tell you which match yours is already on.</p>
+    <p>Not every group uses bankers. Your group admin can switch them off, which suits a group that only sees a fixture now and then — one doubled result would decide the whole table. Groups that use them show a <strong>Banker</strong> tag on the Groups page; groups that don't show <strong>No Banker</strong>. The server-wide Global league has no bankers at all, so it stays a plain comparison.</p>
   </div>
 
   <div class="htp-section">
@@ -6589,7 +6592,8 @@ async def how_to_play(request: Request):
     <h2>Supported Competitions</h2>
     <ul>
       <li>Six Nations</li>
-      <li>The Rugby Championship</li>
+      <li>Nations Championship</li>
+      <li>The Rugby Championship <em>(dormant — returns 2027)</em></li>
       <li>Super Rugby Pacific</li>
       <li>United Rugby Championship (URC)</li>
       <li>Gallagher Premiership</li>
@@ -6597,7 +6601,11 @@ async def how_to_play(request: Request):
       <li>European Champions Cup</li>
       <li>European Challenge Cup</li>
       <li>Rugby World Cup</li>
-      <li>International (Tests &amp; tours)</li>
+      <li>International (Tests &amp; friendlies)</li>
+      <li>Rugby's Greatest Rivalry</li>
+      <li>Puma Trophy</li>
+      <li>Mandela Challenge Plate</li>
+      <li>Bledisloe Cup</li>
     </ul>
     <p>Your group admin picks which of these your group follows. You only see and score on the ones your group has enabled.</p>
   </div>
