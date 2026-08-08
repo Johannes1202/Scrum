@@ -26,7 +26,8 @@ import server  # noqa: E402
 FAILURES = []
 CHECKS = [0]
 
-ALL_TYPES = ("score", "winner", "margin", "btts", "try_anytime", "try_first")
+ALL_TYPES = ("score", "winner", "margin", "btts", "try_anytime", "try_first", "banker")
+NO_BANKER = tuple(t for t in ALL_TYPES if t != "banker")
 KICKOFF = 1787410800.0  # 22 Aug 2026, the 1st Test
 
 
@@ -468,6 +469,20 @@ async def main():
     await server._score_group(60, "CC-2", "international", 20, 20, "draw", "1-7", 1)
     check("a match outside both leagues and the competition is not scored",
           await points(60, "CC-2", "cc1"), None)
+
+    # ── Banker is a per-group rule ────────────────────────────────────────────
+    # Same prediction, same banker flag, two groups: one honours it, one does not.
+    # Banker used to be applied unconditionally, so a group with a single fixture a
+    # month had its table decided by a doubling that made no sense for its format.
+    await setup_group(80, ["bk"], types=ALL_TYPES)           # banker on, as by default
+    await setup_group(81, ["bk"], types=NO_BANKER)           # deliberately switched off
+    await predict("BK-G", "bk", 27, 24, winner="South Africa", banker=1)
+    await server._score_group(80, "BK-G", "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
+    await server._score_group(81, "BK-G", "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
+    on, off = await points(80, "BK-G", "bk"), await points(81, "BK-G", "bk")
+    check("banker doubles where the group allows it", on["pts_banker"] > 0, True)
+    check("banker is ignored where the group does not", off["pts_banker"], 0)
+    check("and the doubled total is exactly twice the plain one", on["points"], off["points"] * 2)
 
     # ── Banker cannot be spent twice in a week ────────────────────────────────
     # Bank Friday, let it pay, then bank Saturday: the flag used to move while the

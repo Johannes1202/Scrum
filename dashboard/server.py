@@ -646,13 +646,24 @@ async def _init_db():
         except Exception:
             pass
     # Global group: enable all prediction types by default
-    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts"):
+    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts", "banker"):
         try:
             await _db.execute(
                 "INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type) VALUES(1,?)", (pt,)
             )
         except Exception:
             pass
+    # Banker used to be unconditional, so no group has a row for it. Scoring now gates on
+    # that row, and without this backfill every existing group would silently lose its
+    # banker the moment this ships. Groups that should not have it are switched off
+    # deliberately afterwards, in the admin UI.
+    try:
+        await _db.execute(
+            """INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type)
+               SELECT id, 'banker' FROM groups"""
+        )
+    except Exception:
+        pass
     await _db.commit()
 
     logger.info("Admin credentials synced: %s", admin)
@@ -876,7 +887,10 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
 
         pts = ps + pw + pm + pb + pta + ptf + pmo
         banker_bonus = 0
-        if int(p.get("is_banker") or 0) == 1 and pts > 0:
+        # Per group: a league with a full weekly round wants a banker, a group that sees
+        # one fixture a month does not, and the same prediction can be banked in one and
+        # not the other.
+        if "banker" in pred_types and int(p.get("is_banker") or 0) == 1 and pts > 0:
             banker_bonus = pts
             pts *= 2
 
@@ -2393,10 +2407,17 @@ PREDICTION_TYPES = [
     ("try_anytime","Anytime Try Scorer",    "Pick a player who scores a try at any point.",               "auto"),
     ("try_first",  "First Try Scorer",      "Pick the player who scores the very first try.",             "auto"),
     ("btts",       "Both Teams to Score",   "Will both teams score at least one try?",                   "auto"),
+    ("banker",     "Banker Pick",           "Let players double one match a week. Suits a league with a "
+                                            "full round of fixtures; makes little sense where a group only "
+                                            "has a game now and then.",                                     "auto"),
 ]
 # resolve_type: "auto" = ESPN resolves it; "manual" = admin may need to enter it
 PRED_RESOLVE = {k: r for k, _, _, r in PREDICTION_TYPES}
 PRED_LABEL   = {k: l for k, l, _, _ in PREDICTION_TYPES}
+# Short forms for the group cards — the full labels do not fit a chip.
+PRED_CHIP = {"score": "Score", "winner": "Winner", "margin": "Margin",
+             "try_anytime": "Any Try", "try_first": "1st Try", "btts": "BTTS",
+             "banker": "Banker"}
 
 
 async def _get_friends(username: str) -> list[str]:
@@ -3594,6 +3615,15 @@ async def groups_page(request: Request):
         ) as cur:
             member_count = (await cur.fetchone())["n"]
         role_badge = '<span style="color:var(--accent3);font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Admin</span>' if g["role"] == "admin" else ""
+        # Which rules are in play differs per group now, and that changes how you play —
+        # so say it on the card rather than making someone open Settings to find out.
+        g_types = await _group_pred_types(g["id"])
+        chips = "".join(
+            f'<span class="gc-chip">{PRED_CHIP[k]}</span>'
+            for k, *_ in PREDICTION_TYPES if k in g_types)
+        if "banker" not in g_types:
+            chips += '<span class="gc-chip gc-chip-off">No Banker</span>'
+        chips_html = f'<div class="gc-chips">{chips}</div>' if chips else ""
         desc = f'<div style="color:var(--muted);font-size:.85rem;margin:.3rem 0 .6rem">{_esc(g["description"] or "")}</div>' if g["description"] else '<div style="margin:.4rem 0"></div>'
         cards += f"""<a href="/groups/{_esc(g['slug'])}" class="group-card">
   <div class="gc-header">
@@ -3601,6 +3631,7 @@ async def groups_page(request: Request):
     {role_badge}
   </div>
   {desc}
+  {chips_html}
   <div class="gc-meta">{member_count} member{"s" if member_count != 1 else ""}</div>
 </a>"""
 
@@ -3620,6 +3651,11 @@ async def groups_page(request: Request):
 .gc-header{{display:flex;align-items:center;justify-content:space-between;gap:.5rem}}
 .gc-name{{font-family:'Barlow Condensed',sans-serif;font-size:1.1rem;font-weight:700;letter-spacing:.03em}}
 .gc-meta{{font-size:.8rem;color:var(--muted)}}
+.gc-chips{{display:flex;flex-wrap:wrap;gap:.3rem;margin:.1rem 0 .5rem}}
+.gc-chip{{font-size:.65rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  padding:.15rem .4rem;border-radius:5px;background:var(--surface2);color:var(--muted);
+  border:1px solid var(--border);white-space:nowrap}}
+.gc-chip-off{{background:transparent;color:var(--danger);border-style:dashed}}
 .empty{{text-align:center;color:var(--muted);padding:3rem 1rem;font-size:.95rem}}
 </style></head><body>
 {_nav(username, is_admin, "groups")}
@@ -5524,6 +5560,20 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
   {_player_select("pred_try_first", player_pool_home, player_pool_away, cur_tf)}
 </div>"""
 
+    # Offered only where some group of theirs following this competition actually
+    # honours it, so a player is never invited to spend a banker that cannot score.
+    banker_toggle = """
+    <label class="banker-toggle">
+      <input type="checkbox" name="is_banker" value="1" id="banker-cb">
+      <div class="banker-label">
+        <span class="banker-icon">\U0001F512</span>
+        <div>
+          <div style="font-weight:600;font-size:.88rem">Banker Pick</div>
+          <div style="font-size:.75rem;color:var(--muted)">Double points if correct — one per week</div>
+        </div>
+      </div>
+    </label>""" if "banker" in active_pred_types else ""
+
     # Build prediction form or status
     if my_pred:
         form_html = f"""<div class="pred-box pred-done">
@@ -5569,16 +5619,7 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
       <div class="pb-team">{_crest_img(crests, team_away, 'pb-crest')}{_esc(team_away)}</div>
     </div>
     {extra_fields}
-    <label class="banker-toggle">
-      <input type="checkbox" name="is_banker" value="1" id="banker-cb">
-      <div class="banker-label">
-        <span class="banker-icon">🔒</span>
-        <div>
-          <div style="font-weight:600;font-size:.88rem">Banker Pick</div>
-          <div style="font-size:.75rem;color:var(--muted)">Double points if correct — one per week</div>
-        </div>
-      </div>
-    </label>
+    {banker_toggle}
     <button type="submit" class="btn" style="width:100%;margin-top:.75rem">Lock In Prediction</button>
   </form>
 </div>
