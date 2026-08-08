@@ -928,6 +928,26 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
 BANKER_WEEK = 604800
 
 
+async def _player_league_scope(username: str) -> set[str]:
+    """Competitions a player actually cares about — their own groups' leagues.
+
+    Global follows every league, so counting it here made "Predict Now" advertise any
+    fixture in any of the fifteen competitions regardless of what the player had joined.
+    Excluded, in the same spirit as the missed-prediction count and the custom-fixture
+    merge, both of which already skip group 1.
+
+    The exception is a player whose only group IS Global: then Global is their entire
+    scoring context and everything genuinely is relevant, so they see the lot.
+    """
+    groups = await _get_user_groups(username, include_global=False)
+    if not groups:
+        return set(ALL_ESPN_LEAGUES)
+    scope: set[str] = set()
+    for g in groups:
+        scope.update(await _group_leagues(g["id"]))
+    return scope
+
+
 async def _banker_spent_on(username: str, week_start: float, now: float) -> str | None:
     """The match this week's banker was already spent on, if it has kicked off.
 
@@ -2747,11 +2767,18 @@ async def me_page(request: Request):
                     "slug": cm["match_id"],
                 })
         full_upcoming.sort(key=lambda m: m.get("kickoff_ts") or 0)
+        # Only fixtures this player's own groups actually cover. A match hand-picked into
+        # one of their custom competitions counts too, even though its group may follow no
+        # league at all — that is the whole point of a one-off event group.
+        my_leagues = await _player_league_scope(username)
+        my_custom_mids = set(all_custom_match_data)
         for m in full_upcoming:
             kts = m.get("kickoff_ts") or 0
             if not kts or kts <= now_ts:
                 continue
             m_slug = m.get("slug") or re.sub(r"[^a-z0-9]+", "-", f"{m['team_home']}-vs-{m['team_away']}".lower()).strip("-")
+            if (m.get("tournament") or "") not in my_leagues and m_slug not in my_custom_mids:
+                continue
             async with _db.execute(
                 "SELECT id FROM predictions WHERE username=? AND match_id=?", (username, m_slug)
             ) as cur:

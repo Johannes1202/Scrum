@@ -470,6 +470,24 @@ async def main():
     check("a match outside both leagues and the competition is not scored",
           await points(60, "CC-2", "cc1"), None)
 
+    # ── Predict Now is scoped to the player's own groups ──────────────────────
+    # Global follows all fifteen competitions, so counting it advertised every fixture in
+    # the app no matter what a player had joined.
+    await setup_group(95, ["scoped"], leagues=("urc",))
+    scope = await server._player_league_scope("scoped")
+    check("scope is the player's own group's leagues", scope, {"urc"})
+    check("Global's other leagues are not pulled in", "six-nations" in scope, False)
+
+    # A player whose only group is Global keeps the full list — Global is then their
+    # entire scoring context and everything really is relevant.
+    await server._db.execute(
+        "INSERT OR IGNORE INTO users (username,password_hash,is_admin,created_at) VALUES(?,?,0,?)",
+        ("lonely", "x", time.time()))
+    await server._db.commit()
+    lonely = await server._player_league_scope("lonely")
+    check("a player with no groups of their own sees everything",
+          lonely == set(server.ALL_ESPN_LEAGUES), True)
+
     # ── The banker backfill runs once, not on every boot ──────────────────────
     # It was written as a plain INSERT OR IGNORE at startup, so every restart re-armed
     # the banker for every group and silently undid deliberate opt-outs.
