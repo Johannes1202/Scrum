@@ -469,6 +469,28 @@ async def main():
     check("a match outside both leagues and the competition is not scored",
           await points(60, "CC-2", "cc1"), None)
 
+    # ── Banker cannot be spent twice in a week ────────────────────────────────
+    # Bank Friday, let it pay, then bank Saturday: the flag used to move while the
+    # already-scored points stayed banked, so the doubling accumulated all week.
+    await setup_group(70, ["bank1"], leagues=("international",))
+    wk = server._banker_week_start(KICKOFF)
+    now = KICKOFF + 3600            # Friday's match has kicked off
+    await predict("BK-FRI", "bank1", 10, 10, banker=1, tournament="international")
+    await server._db.execute("UPDATE predictions SET kickoff_ts=? WHERE match_id=?",
+                             (KICKOFF, "BK-FRI"))
+    await server._db.commit()
+    check("a started banker this week is reported as spent",
+          await server._banker_spent_on("bank1", wk, now) is not None, True)
+
+    # Before it kicks off it is still movable, which is the intended behaviour.
+    check("an unstarted banker is not spent",
+          await server._banker_spent_on("bank1", wk, KICKOFF - 3600), None)
+
+    # And a banker in a different week never blocks this one.
+    check("a banker in another week does not count",
+          await server._banker_spent_on("bank1", wk + server.BANKER_WEEK,
+                                        now + server.BANKER_WEEK), None)
+
     # ── Banker week bucketing ─────────────────────────────────────────────────
     wk = server._banker_week_start
     check("same round shares a bucket", wk(KICKOFF), wk(KICKOFF + 3600 * 24))

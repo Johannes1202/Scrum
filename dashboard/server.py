@@ -898,6 +898,28 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
 BANKER_WEEK = 604800
 
 
+async def _banker_spent_on(username: str, week_start: float, now: float) -> str | None:
+    """The match this week's banker was already spent on, if it has kicked off.
+
+    A banker on a match that has started is final. Without this the "move the banker"
+    update below would clear the flag off a match that had already been scored, leaving
+    its doubled points banked in the leaderboard while the flag moved to a later game —
+    so a player could bank Friday's result, watch it pay, and bank Saturday's as well,
+    repeatedly, for as many days as a bucket has fixtures. It had never happened because
+    every previous round kicked off on a single day; the tour is the first bucket to
+    span two, and club rounds from September span three.
+    """
+    async with _db.execute(
+        """SELECT match_title, match_id FROM predictions
+           WHERE username=? AND is_banker=1
+             AND kickoff_ts>=? AND kickoff_ts<? AND kickoff_ts<=?
+           LIMIT 1""",
+        (username, week_start, week_start + BANKER_WEEK, now),
+    ) as cur:
+        row = await cur.fetchone()
+    return (dict(row)["match_title"] or dict(row)["match_id"]) if row else None
+
+
 def _banker_week_start(ts: float) -> float:
     """Start of the 7-day bucket a kickoff falls in.
 
@@ -5587,7 +5609,11 @@ document.getElementById('pred-form').addEventListener('submit',async function(e)
         +'<div class="pb-dash">—</div>'
         +'<div style="font-size:2rem;font-weight:700;color:var(--accent3)">'+d.away+'</div>'
         +'<div class="pb-team">'+d.team_away+'</div></div>'
-        +'<div style="text-align:center;color:var(--muted);font-size:.85rem">Locked in ✓</div>';
+        +'<div style="text-align:center;color:var(--muted);font-size:.85rem">Locked in ✓</div>'
+        +(d.banker_refused
+          ? '<div style="text-align:center;color:#c77b00;font-size:.78rem;margin-top:.4rem">'
+            +'Banker not applied — already used this week on '+d.banker_refused+'.</div>'
+          : '');
     }}else{{
       btn.disabled=false; btn.textContent='Lock In Prediction';
       alert(d.error||'Something went wrong');
@@ -5716,6 +5742,15 @@ async def api_predict(
     # rule reads as "one banker per round" regardless of when the pick was entered.
     banker_week = _banker_week_start(kickoff_ts if kickoff_ts > 0 else now)
 
+    # A banker already spent on a kicked-off match this week cannot be moved. The
+    # prediction still saves — only the banker is refused — so a late pick is never
+    # lost just because the player also ticked a box they were not entitled to.
+    banker_refused = None
+    if banker_val:
+        banker_refused = await _banker_spent_on(username, banker_week, now)
+        if banker_refused:
+            banker_val = 0
+
     try:
         await _db.execute(
             """INSERT INTO predictions
@@ -5755,15 +5790,18 @@ async def api_predict(
     # banker on a later round be cleared by one entered for an earlier round. Excludes
     # this match so a resubmit can never strip the pick it just set.
     if banker_val:
+        # kickoff_ts>? as well: a banker on a match that has started is immutable, so the
+        # flag can never drift out of step with points already written to the leaderboard.
         await _db.execute(
             """UPDATE predictions SET is_banker=0
                WHERE username=? AND is_banker=1 AND match_id<>?
-                 AND kickoff_ts>=? AND kickoff_ts<?""",
-            (username, slug, banker_week, banker_week + 604800),
+                 AND kickoff_ts>=? AND kickoff_ts<? AND kickoff_ts>?""",
+            (username, slug, banker_week, banker_week + BANKER_WEEK, now),
         )
     await _db.commit()
     return JSONResponse({"ok": True, "home": score_home, "away": score_away,
-                         "team_home": team_home, "team_away": team_away})
+                         "team_home": team_home, "team_away": team_away,
+                         "banker_refused": banker_refused})
 
 
 # ── Standings ─────────────────────────────────────────────────────────────────
