@@ -2939,7 +2939,7 @@ async def me_page(request: Request):
   <div class="section-title">Predict Now</div>
   <a href="{_pred_url(m)}" class="next-match-card">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(m['team_home'])}</span>{_crest_img(crests, m['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, m['team_away'], 'nm-crest')}<span class="vs-name">{_esc(m['team_away'])}</span></span></div>
+    <div class="nm-teams vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(m['team_home'])}</span>{_crest_img(crests, m['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, m['team_away'], 'nm-crest')}<span class="vs-name">{_esc(m['team_away'])}</span></span></div>
     <div class="nm-foot">
       <span class="nm-countdown">⏱ {_match_countdown(kts)} to kickoff</span>
       <span class="nm-cta">Predict →</span>
@@ -2955,7 +2955,7 @@ async def me_page(request: Request):
   <div class="section-title">Coming Up</div>
   <div class="next-match-card" style="opacity:.75;cursor:default">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(next_upcoming['team_home'])}</span>{_crest_img(crests, next_upcoming['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, next_upcoming['team_away'], 'nm-crest')}<span class="vs-name">{_esc(next_upcoming['team_away'])}</span></span></div>
+    <div class="nm-teams vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(next_upcoming['team_home'])}</span>{_crest_img(crests, next_upcoming['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, next_upcoming['team_away'], 'nm-crest')}<span class="vs-name">{_esc(next_upcoming['team_away'])}</span></span></div>
     <div class="nm-foot">
       <span class="nm-countdown">Window opens in {opens_in}</span>
       <span class="nm-cta" style="opacity:.5">Not yet</span>
@@ -3025,7 +3025,7 @@ async def me_page(request: Request):
             exact_tick = ""
         recent_html += f"""<div class="rec-row">
   <div class="rec-main">
-    <div class="rec-match vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(r['team_home'])}</span>{_crest_img(crests, r['team_home'], 'rec-crest')}</span><span class="vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, r['team_away'], 'rec-crest')}<span class="vs-name">{_esc(r['team_away'])}</span></span></div>
+    <div class="rec-match vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(r['team_home'])}</span>{_crest_img(crests, r['team_home'], 'rec-crest')}</span><span class="vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, r['team_away'], 'rec-crest')}<span class="vs-name">{_esc(r['team_away'])}</span></span></div>
     <div class="rec-meta">{_esc(league_name)} · Your pick: {r['score_home']}–{r['score_away']} · Result: {result_txt}{exact_tick}</div>
   </div>
   {pts_badge}
@@ -6428,6 +6428,21 @@ async def history_page(request: Request, t: str = "all"):
 @media(min-width:500px){{.hmr-league{{display:block}}}}
 .hmr-chevron{{color:var(--muted);font-size:.95rem;transition:transform .2s;flex-shrink:0}}
 .hist-match-row.open .hmr-chevron{{transform:rotate(180deg)}}
+/* Narrow screens: give the matchup the whole first line and drop the date and score
+   to a second, the way .fix-row already does. One line could not hold a date, two club
+   names, two crests and a score at 390px, so both names truncated hard - and mirroring
+   made that more obvious because they now truncate symmetrically. Ordered rather than
+   restructured so the DOM (and the wide layout) is untouched. The score keeps its size
+   and accent and is pushed right, so it stays a scannable column instead of becoming
+   meta text - it is the payload on a results page. */
+@media(max-width:600px){{
+  .hmr-main{{flex-wrap:wrap;row-gap:.3rem;column-gap:.5rem}}
+  .hmr-title{{order:1;flex:0 0 100%}}
+  .hmr-date{{order:2}}
+  .hmr-league{{order:3;display:block}}
+  .hmr-score{{order:4;margin-left:auto}}
+  .hmr-chevron{{order:5}}
+}}
 .hmr-body{{display:none;border-top:1px solid var(--border);padding:.75rem .85rem}}
 .hist-match-row.open .hmr-body{{display:block}}
 .hist-preds-toggle{{display:inline-flex;align-items:center;gap:.25rem;margin-top:.65rem;font-size:.78rem;color:var(--muted);cursor:pointer;user-select:none;font-family:'Barlow Condensed',sans-serif;font-weight:700;letter-spacing:.04em;text-transform:uppercase}}
