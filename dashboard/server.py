@@ -1958,6 +1958,15 @@ a{color:inherit;text-decoration:none}
 .nm-crest{width:26px;height:26px;object-fit:contain;vertical-align:-6px;margin-right:.4rem}
 .rec-crest{width:16px;height:16px;object-fit:contain;vertical-align:-3px;margin-right:.25rem}
 .pb-crest{width:28px;height:28px;object-fit:contain;display:block;margin:0 auto .3rem}
+.vs-row{display:flex;align-items:center;gap:.3rem;min-width:0}
+.vs-side{display:flex;align-items:center;gap:.28rem;min-width:0}
+.vs-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vs-side img{margin:0;flex-shrink:0}
+.vs-mid{flex-shrink:0}
+.vs-bal{justify-content:center}
+.vs-bal .vs-side{flex:1}
+.vs-bal .vs-home{justify-content:flex-end;text-align:right}
+.vs-bal .vs-away{justify-content:flex-start;text-align:left}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .nav-wordmark{height:28px;width:auto;display:block}
@@ -2930,7 +2939,7 @@ async def me_page(request: Request):
   <div class="section-title">Predict Now</div>
   <a href="{_pred_url(m)}" class="next-match-card">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams">{_crest_img(crests, m['team_home'], 'nm-crest')}{_esc(m['team_home'])} <span class="nm-vs">vs</span> {_crest_img(crests, m['team_away'], 'nm-crest')}{_esc(m['team_away'])}</div>
+    <div class="nm-teams vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(m['team_home'])}</span>{_crest_img(crests, m['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, m['team_away'], 'nm-crest')}<span class="vs-name">{_esc(m['team_away'])}</span></span></div>
     <div class="nm-foot">
       <span class="nm-countdown">⏱ {_match_countdown(kts)} to kickoff</span>
       <span class="nm-cta">Predict →</span>
@@ -2946,7 +2955,7 @@ async def me_page(request: Request):
   <div class="section-title">Coming Up</div>
   <div class="next-match-card" style="opacity:.75;cursor:default">
     <div class="nm-league">{_esc(league_name)}</div>
-    <div class="nm-teams">{_crest_img(crests, next_upcoming['team_home'], 'nm-crest')}{_esc(next_upcoming['team_home'])} <span class="nm-vs">vs</span> {_crest_img(crests, next_upcoming['team_away'], 'nm-crest')}{_esc(next_upcoming['team_away'])}</div>
+    <div class="nm-teams vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(next_upcoming['team_home'])}</span>{_crest_img(crests, next_upcoming['team_home'], 'nm-crest')}</span><span class="nm-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, next_upcoming['team_away'], 'nm-crest')}<span class="vs-name">{_esc(next_upcoming['team_away'])}</span></span></div>
     <div class="nm-foot">
       <span class="nm-countdown">Window opens in {opens_in}</span>
       <span class="nm-cta" style="opacity:.5">Not yet</span>
@@ -3016,7 +3025,7 @@ async def me_page(request: Request):
             exact_tick = ""
         recent_html += f"""<div class="rec-row">
   <div class="rec-main">
-    <div class="rec-match">{_crest_img(crests, r['team_home'], 'rec-crest')}{_esc(r['team_home'])} vs {_crest_img(crests, r['team_away'], 'rec-crest')}{_esc(r['team_away'])}</div>
+    <div class="rec-match vs-row"><span class="vs-side vs-home"><span class="vs-name">{_esc(r['team_home'])}</span>{_crest_img(crests, r['team_home'], 'rec-crest')}</span><span class="vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, r['team_away'], 'rec-crest')}<span class="vs-name">{_esc(r['team_away'])}</span></span></div>
     <div class="rec-meta">{_esc(league_name)} · Your pick: {r['score_home']}–{r['score_away']} · Result: {result_txt}{exact_tick}</div>
   </div>
   {pts_badge}
@@ -3438,7 +3447,7 @@ async def h2h_page(request: Request, target: str):
     <div class="h2h-rowpts">{mp} pts</div>
   </div>
   <div class="h2h-match-info">
-    <div class="h2h-match-title">{_crest_img(crests, m['team_home'], 'rec-crest')}{_esc(m['team_home'])} {m['final_home']}–{m['final_away']} {_crest_img(crests, m['team_away'], 'rec-crest')}{_esc(m['team_away'])}</div>
+    <div class="h2h-match-title vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(m['team_home'])}</span>{_crest_img(crests, m['team_home'], 'rec-crest')}</span><span class="vs-mid">{m['final_home']}–{m['final_away']}</span><span class="vs-side vs-away">{_crest_img(crests, m['team_away'], 'rec-crest')}<span class="vs-name">{_esc(m['team_away'])}</span></span></div>
     <div class="h2h-match-meta">{_esc(league_name)} · {kick_str}</div>
   </div>
   <div class="h2h-cell h2h-cell-r {th_win}">
@@ -3829,8 +3838,7 @@ async def group_home(request: Request, slug: str):
         else:
             status = f'<a class="fix-status fix-closed" href="{pred_url}">View</a>'
         return (f'<div class="fix-row">'
-                f'<span class="fix-teams">{_crest_img(crests, th)}{_esc(th)} '
-                f'<span class="fix-vs">vs</span> {_crest_img(crests, ta)}{_esc(ta)}</span>'
+                f'<span class="fix-teams vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(th)}</span>{_crest_img(crests, th)}</span><span class="fix-vs vs-mid">vs</span><span class="vs-side vs-away">{_crest_img(crests, ta)}<span class="vs-name">{_esc(ta)}</span></span></span>'
                 f'<span class="fix-foot">{t_str}{status}</span>'
                 f'</div>')
 
@@ -6383,8 +6391,7 @@ async def history_page(request: Request, t: str = "all"):
             f'<div class="hist-match-row" onclick="toggleHistMatch(this)">'
             f'<div class="hmr-main">'
             f'<span class="hmr-date">{dt}</span>'
-            f'<span class="hmr-title">{_crest_img(crests, m["team_home"], "rec-crest")}{_esc(m["team_home"])}'
-            f' <span class="fix-vs">v</span> {_crest_img(crests, m["team_away"], "rec-crest")}{_esc(m["team_away"])}</span>'
+            f'<span class="hmr-title vs-row vs-bal"><span class="vs-side vs-home"><span class="vs-name">{_esc(m["team_home"])}</span>{_crest_img(crests, m["team_home"], "rec-crest")}</span><span class="fix-vs vs-mid">v</span><span class="vs-side vs-away">{_crest_img(crests, m["team_away"], "rec-crest")}<span class="vs-name">{_esc(m["team_away"])}</span></span></span>'
             f'<span class="hmr-score">{m["final_home"]}—{m["final_away"]}</span>'
             f'<span class="hmr-league">{_esc(league_name)}</span>'
             f'<span class="hmr-chevron material-symbols-outlined">expand_more</span>'
@@ -6579,8 +6586,10 @@ async def leaderboard(request: Request, t: str = "all"):
         # alt text rather than repeating it to a screen reader.
         ih = f'<img class="fix-crest" src="{ch}" alt="" loading="lazy">' if ch else ""
         ia = f'<img class="fix-crest" src="{ca}" alt="" loading="lazy">' if ca else ""
-        return (f'<div class="fix-row"><span class="fix-teams">{ih}{_esc(th)} '
-                f'<span class="fix-vs">vs</span> {ia}{_esc(ta)}</span>'
+        return (f'<div class="fix-row"><span class="fix-teams vs-row vs-bal">'
+                f'<span class="vs-side vs-home"><span class="vs-name">{_esc(th)}</span>{ih}</span>'
+                f'<span class="fix-vs vs-mid">vs</span>'
+                f'<span class="vs-side vs-away">{ia}<span class="vs-name">{_esc(ta)}</span></span></span>'
                 f'<span class="fix-foot">{t_str}{status}</span></div>')
 
     # Count open unpredicted fixtures per tournament for notification badges
