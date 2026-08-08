@@ -669,6 +669,51 @@ async def _init_db():
     await _db.execute(
         "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
+    # One banker per group, per player, per week — enforced by the primary key rather
+    # than by application code. The banker used to live on the shared prediction row,
+    # which made the choice global: a player could bank only one match a week in total
+    # and it doubled in every group at once, so a group could not be played on its own
+    # terms. kickoff_ts is denormalised so the "already kicked off" check needs no join.
+    await _db.execute(
+        """CREATE TABLE IF NOT EXISTS group_bankers (
+               group_id    INTEGER NOT NULL,
+               username    TEXT    NOT NULL,
+               match_id    TEXT    NOT NULL,
+               banker_week REAL    NOT NULL,
+               kickoff_ts  REAL    NOT NULL,
+               created_at  REAL    NOT NULL,
+               PRIMARY KEY (group_id, username, banker_week)
+           )"""
+    )
+    await _db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_bankers_match ON group_bankers(group_id,username,match_id)"
+    )
+    # One-time: fan every historical banker out to the groups that would have honoured
+    # it. Groups with the rule switched off get nothing, which matches the leaderboards
+    # they have already been rescored to. Marked done so a restart cannot repeat it —
+    # the same fault the banker backfill shipped with twice.
+    async with _db.execute("SELECT value FROM app_meta WHERE key='group_bankers_migrated'") as cur:
+        _gb_done = await cur.fetchone()
+    if not _gb_done:
+        async with _db.execute(
+            "SELECT username, match_id, tournament, kickoff_ts FROM predictions WHERE is_banker=1"
+        ) as cur:
+            _old = [dict(r) for r in await cur.fetchall()]
+        _n = 0
+        for _p in _old:
+            for _g in await _banker_groups_for(_p["username"], _p["match_id"], _p["tournament"] or ""):
+                await _db.execute(
+                    """INSERT OR IGNORE INTO group_bankers
+                       (group_id,username,match_id,banker_week,kickoff_ts,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (_g["id"], _p["username"], _p["match_id"],
+                     _banker_week_start(_p["kickoff_ts"] or 0), _p["kickoff_ts"] or 0, time.time()),
+                )
+                _n += 1
+        await _db.execute(
+            "INSERT OR REPLACE INTO app_meta (key,value) VALUES('group_bankers_migrated','done')")
+        logger.info("Per-group bankers migrated: %d rows from %d predictions", _n, len(_old))
+    await _db.commit()
     async with _db.execute("SELECT value FROM app_meta WHERE key='banker_backfill'") as cur:
         already = await cur.fetchone()
     if not already:
@@ -906,7 +951,16 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
         # Per group: a league with a full weekly round wants a banker, a group that sees
         # one fixture a month does not, and the same prediction can be banked in one and
         # not the other.
-        if "banker" in pred_types and int(p.get("is_banker") or 0) == 1 and pts > 0:
+        # Read from group_bankers, not the shared prediction row: the same prediction may
+        # be this player's banker in one group and an ordinary pick in another.
+        banked_here = False
+        if "banker" in pred_types and pts > 0:
+            async with _db.execute(
+                "SELECT 1 FROM group_bankers WHERE group_id=? AND username=? AND match_id=? LIMIT 1",
+                (group_id, p["username"], match_id),
+            ) as bcur:
+                banked_here = await bcur.fetchone() is not None
+        if banked_here:
             banker_bonus = pts
             pts *= 2
 
@@ -948,7 +1002,26 @@ async def _player_league_scope(username: str) -> set[str]:
     return scope
 
 
-async def _banker_spent_on(username: str, week_start: float, now: float) -> str | None:
+async def _banker_groups_for(username: str, match_id: str, tournament: str) -> list[dict]:
+    """Groups of this player that would honour a banker on this match.
+
+    A group qualifies if it has the banker rule on AND covers the match — either it
+    follows the competition, or the match was hand-picked into one of its custom
+    competitions, which is how a one-off event group covers anything at all.
+    """
+    out = []
+    for g in await _get_user_groups(username, include_global=True):
+        if "banker" not in await _group_pred_types(g["id"]):
+            continue
+        if tournament and tournament in await _group_leagues(g["id"]):
+            out.append(g)
+        elif match_id in await _all_group_custom_matches(g["id"]):
+            out.append(g)
+    return out
+
+
+async def _banker_spent_on(username: str, group_id: int, week_start: float,
+                           now: float) -> str | None:
     """The match this week's banker was already spent on, if it has kicked off.
 
     A banker on a match that has started is final. Without this the "move the banker"
@@ -960,14 +1033,17 @@ async def _banker_spent_on(username: str, week_start: float, now: float) -> str 
     span two, and club rounds from September span three.
     """
     async with _db.execute(
-        """SELECT match_title, match_id FROM predictions
-           WHERE username=? AND is_banker=1
-             AND kickoff_ts>=? AND kickoff_ts<? AND kickoff_ts<=?
+        """SELECT gb.match_id, p.match_title FROM group_bankers gb
+           LEFT JOIN predictions p ON p.match_id=gb.match_id AND p.username=gb.username
+           WHERE gb.group_id=? AND gb.username=? AND gb.banker_week=? AND gb.kickoff_ts<=?
            LIMIT 1""",
-        (username, week_start, week_start + BANKER_WEEK, now),
+        (group_id, username, week_start, now),
     ) as cur:
         row = await cur.fetchone()
-    return (dict(row)["match_title"] or dict(row)["match_id"]) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    return d.get("match_title") or d["match_id"]
 
 
 def _banker_week_start(ts: float) -> float:
@@ -2103,6 +2179,13 @@ input:focus,select:focus{border-color:var(--header)}
 .pef-worth{font-size:.68rem;font-weight:600;letter-spacing:.04em;color:var(--muted);opacity:.75;text-transform:none}
 select.pef-select.pef-unset{border-color:#f5a623;background:rgba(245,166,35,.06)}
 .pef-hint{display:none;font-size:.72rem;color:#c77b00;margin-top:.3rem}
+.bkr-opts{display:flex;flex-wrap:wrap;gap:.4rem}
+.bkr-opt{display:flex;align-items:center;gap:.35rem;font-size:.8rem;font-weight:600;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:.3rem .55rem;cursor:pointer}
+.bkr-opt input{width:15px;height:15px;accent-color:var(--accent3);margin:0}
+.bkr-spent{opacity:.55;cursor:not-allowed;font-weight:500}
+.bkr-note{font-size:.68rem;color:var(--muted);font-weight:400}
 select.pef-select.pef-unset+.pef-hint{display:block}
 .pef-opts{display:flex;gap:1rem;flex-wrap:wrap}
 .radio-opt{display:flex;align-items:center;gap:.4rem;font-size:.9rem;cursor:pointer}
@@ -5638,19 +5721,35 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
   {_player_select("pred_try_first", player_pool_home, player_pool_away, cur_tf)}
 </div>"""
 
-    # Offered only where some group of theirs following this competition actually
-    # honours it, so a player is never invited to spend a banker that cannot score.
-    banker_toggle = """
-    <label class="banker-toggle">
-      <input type="checkbox" name="is_banker" value="1" id="banker-cb">
-      <div class="banker-label">
+    # One control per group that would honour a banker here. The banker is per group, so
+    # a player can bank this match in their league and leave it a plain pick elsewhere.
+    # A group whose banker is already spent on a match that has kicked off is shown
+    # disabled with the reason, rather than silently missing.
+    banker_toggle = ""
+    _bkr_groups = await _banker_groups_for(username, slug, tournament)
+    if _bkr_groups and window_open:
+        _bwk = _banker_week_start(kickoff_ts if kickoff_ts > 0 else now)
+        _opts = ""
+        for _g in _bkr_groups:
+            _spent = await _banker_spent_on(username, _g["id"], _bwk, now)
+            if _spent:
+                _opts += (f'<label class="bkr-opt bkr-spent" title="Already used this week on '
+                          f'{_esc(_spent)}"><input type="checkbox" disabled> {_esc(_g["name"])}'
+                          f'<span class="bkr-note">used on {_esc(_spent)}</span></label>')
+            else:
+                _opts += (f'<label class="bkr-opt"><input type="checkbox" name="banker_groups" '
+                          f'value="{_g["id"]}"> {_esc(_g["name"])}</label>')
+        banker_toggle = f"""
+    <div class="banker-toggle" style="display:block">
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem">
         <span class="banker-icon">\U0001F512</span>
         <div>
           <div style="font-weight:600;font-size:.88rem">Banker Pick</div>
-          <div style="font-size:.75rem;color:var(--muted)">Double points if correct — one per week</div>
+          <div style="font-size:.75rem;color:var(--muted)">Doubles this match — one per group, per week</div>
         </div>
       </div>
-    </label>""" if "banker" in active_pred_types else ""
+      <div class="bkr-opts">{_opts}</div>
+    </div>"""
 
     # Build prediction form or status
     if my_pred:
@@ -5731,7 +5830,7 @@ document.getElementById('pred-form').addEventListener('submit',async function(e)
         +'<div style="text-align:center;color:var(--muted);font-size:.85rem">Locked in ✓</div>'
         +(d.banker_refused
           ? '<div style="text-align:center;color:#c77b00;font-size:.78rem;margin-top:.4rem">'
-            +'Banker not applied — already used this week on '+d.banker_refused+'.</div>'
+            +'Banker not applied in: '+d.banker_refused+'</div>'
           : '');
     }}else{{
       btn.disabled=false; btn.textContent='Lock In Prediction';
@@ -5845,6 +5944,7 @@ async def api_predict(
     pred_try_any: str = Form(default=""),
     pred_try_first: str = Form(default=""),
     is_banker: str = Form(default=""),
+    banker_groups: list[str] = Form(default=[]),
 ):
     username = _get_session_user(request)
     if not username:
@@ -5861,14 +5961,31 @@ async def api_predict(
     # rule reads as "one banker per round" regardless of when the pick was entered.
     banker_week = _banker_week_start(kickoff_ts if kickoff_ts > 0 else now)
 
-    # A banker already spent on a kicked-off match this week cannot be moved. The
-    # prediction still saves — only the banker is refused — so a late pick is never
-    # lost just because the player also ticked a box they were not entitled to.
+    # The banker is now chosen per group. Work out which of the player's groups would
+    # honour one here, then take only the ticked ones that are actually eligible — a
+    # posted group id is not trusted. A stale form posting the old single is_banker flag
+    # is read as "all eligible groups", which is what it used to mean.
+    eligible = await _banker_groups_for(username, slug, tournament.strip())
+    eligible_ids = {g["id"]: g["name"] for g in eligible}
+    wanted = {int(b) for b in banker_groups if str(b).strip().isdigit()} & set(eligible_ids)
+    if banker_val and not banker_groups:
+        wanted = set(eligible_ids)
+
+    # A banker already spent on a kicked-off match is final — per group, so spending it
+    # in one group never blocks another. The prediction still saves; only the banker is
+    # refused, so a late pick is never lost over a box the player could not tick.
     banker_refused = None
-    if banker_val:
-        banker_refused = await _banker_spent_on(username, banker_week, now)
-        if banker_refused:
-            banker_val = 0
+    accepted_groups = []
+    refused_names = []
+    for gid in wanted:
+        spent = await _banker_spent_on(username, gid, banker_week, now)
+        if spent:
+            refused_names.append(f"{eligible_ids[gid]} (already on {spent})")
+        else:
+            accepted_groups.append(gid)
+    if refused_names:
+        banker_refused = "; ".join(refused_names)
+    banker_val = 1 if accepted_groups else 0
 
     try:
         await _db.execute(
@@ -5904,18 +6021,16 @@ async def api_predict(
                                  "team_home": d["team_home"], "team_away": d["team_away"]})
         return JSONResponse({"error": "already predicted"}, status_code=409)
 
-    # The insert succeeded, so it is now safe to move the banker off any other match
-    # in the same round. Bounded at both ends — an unbounded lower-only window let a
-    # banker on a later round be cleared by one entered for an earlier round. Excludes
-    # this match so a resubmit can never strip the pick it just set.
-    if banker_val:
-        # kickoff_ts>? as well: a banker on a match that has started is immutable, so the
-        # flag can never drift out of step with points already written to the leaderboard.
+    # The insert succeeded, so the banker can now be recorded. The primary key is
+    # (group_id, username, banker_week), so REPLACE moves this week's banker within a
+    # group without any explicit clearing — and the started-match check above is what
+    # stops it moving off a match that has already been scored.
+    for gid in accepted_groups:
         await _db.execute(
-            """UPDATE predictions SET is_banker=0
-               WHERE username=? AND is_banker=1 AND match_id<>?
-                 AND kickoff_ts>=? AND kickoff_ts<? AND kickoff_ts>?""",
-            (username, slug, banker_week, banker_week + BANKER_WEEK, now),
+            """INSERT OR REPLACE INTO group_bankers
+               (group_id,username,match_id,banker_week,kickoff_ts,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (gid, username, slug, banker_week, kickoff_ts, time.time()),
         )
     await _db.commit()
     return JSONResponse({"ok": True, "home": score_home, "away": score_away,

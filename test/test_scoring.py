@@ -69,6 +69,17 @@ async def predict(match_id, username, sh, sa, winner=None, margin=None, btts=Non
     await server._db.commit()
 
 
+async def bank(group_id, username, match_id, kickoff=None):
+    """Record a banker the way the predict route does — per group, per week."""
+    k = KICKOFF if kickoff is None else kickoff
+    await server._db.execute(
+        """INSERT OR REPLACE INTO group_bankers
+           (group_id,username,match_id,banker_week,kickoff_ts,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (group_id, username, match_id, server._banker_week_start(k), k, time.time()))
+    await server._db.commit()
+
+
 async def points(group_id, match_id, username):
     async with server._db.execute(
         "SELECT points,pts_score,pts_winner,pts_margin,pts_btts,pts_try_any,"
@@ -143,6 +154,7 @@ async def main():
     m = "m-banker-text"
     await predict(m, "alice", 27, 24, banker="0")
     await predict(m, "bob", 27, 24, banker="1")
+    await bank(10, "bob", m)
     await server._score_group(10, m, "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
     check("is_banker TEXT '0' is not truthy", (await points(10, m, "alice"))["pts_banker"], 0)
     check("is_banker TEXT '1' doubles", (await points(10, m, "bob"))["pts_banker"] > 0, True)
@@ -151,6 +163,7 @@ async def main():
     m = "m-banker"
     await predict(m, "alice", 27, 24, winner="South Africa", margin="1-7", btts=1, banker=1)
     await predict(m, "bob", 27, 24, winner="South Africa", margin="1-7", btts=1, banker=0)
+    await bank(10, "alice", m)
     await server._score_group(10, m, "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
     a = await points(10, m, "alice")
     b = await points(10, m, "bob")
@@ -180,6 +193,7 @@ async def main():
     # ── Rescoring is idempotent ───────────────────────────────────────────────
     m = "m-idem"
     await predict(m, "alice", 27, 24, winner="South Africa", banker=1)
+    await bank(10, "alice", m)
     await server._score_group(10, m, "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
     first = await points(10, m, "alice")
     for _ in range(3):
@@ -529,6 +543,8 @@ async def main():
     await setup_group(80, ["bk"], types=ALL_TYPES)           # banker on, as by default
     await setup_group(81, ["bk"], types=NO_BANKER)           # deliberately switched off
     await predict("BK-G", "bk", 27, 24, winner="South Africa", banker=1)
+    await bank(80, "bk", "BK-G")
+    await bank(81, "bk", "BK-G")   # recorded, but group 81 has the rule switched off
     await server._score_group(80, "BK-G", "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
     await server._score_group(81, "BK-G", "greatest-rivalry", 27, 24, "South Africa", "1-7", 1)
     on, off = await points(80, "BK-G", "bk"), await points(81, "BK-G", "bk")
@@ -546,17 +562,31 @@ async def main():
     await server._db.execute("UPDATE predictions SET kickoff_ts=? WHERE match_id=?",
                              (KICKOFF, "BK-FRI"))
     await server._db.commit()
+    await bank(70, "bank1", "BK-FRI", KICKOFF)
     check("a started banker this week is reported as spent",
-          await server._banker_spent_on("bank1", wk, now) is not None, True)
+          await server._banker_spent_on("bank1", 70, wk, now) is not None, True)
 
     # Before it kicks off it is still movable, which is the intended behaviour.
     check("an unstarted banker is not spent",
-          await server._banker_spent_on("bank1", wk, KICKOFF - 3600), None)
+          await server._banker_spent_on("bank1", 70, wk, KICKOFF - 3600), None)
 
     # And a banker in a different week never blocks this one.
     check("a banker in another week does not count",
-          await server._banker_spent_on("bank1", wk + server.BANKER_WEEK,
+          await server._banker_spent_on("bank1", 70, wk + server.BANKER_WEEK,
                                         now + server.BANKER_WEEK), None)
+
+    # The decisive property: spending it in one group must not block another.
+    await setup_group(71, ["bank1"], leagues=("international",))
+    check("a banker spent in one group does not block a different group",
+          await server._banker_spent_on("bank1", 71, wk, now), None)
+
+    # One per group per week is enforced by the primary key, not by app code.
+    await bank(70, "bank1", "BK-SAT", KICKOFF + 3600)
+    async with server._db.execute(
+        "SELECT match_id FROM group_bankers WHERE group_id=70 AND username='bank1' AND banker_week=?",
+        (wk,)) as cur:
+        rows = [dict(r)["match_id"] for r in await cur.fetchall()]
+    check("a group holds exactly one banker per week", rows, ["BK-SAT"])
 
     # ── Banker week bucketing ─────────────────────────────────────────────────
     wk = server._banker_week_start
@@ -568,10 +598,19 @@ async def main():
     # interpreter alive in threading._shutdown long after sys.exit(0). all.sh then blocked
     # on this suite forever and test_auth + test_live_espn never ran at all — while every
     # line it printed said "0 failed". Closing it is what lets the process exit.
-    await server._db.close()
+    pass
 
 
-asyncio.run(main())
+async def _run():
+    try:
+        await main()
+    finally:
+        # Close even when a check raises: aiosqlite's worker thread is non-daemon, so a
+        # leaked connection turns a clear failure into a two-minute timeout.
+        await server._db.close()
+
+
+asyncio.run(_run())
 
 print(f"scoring: {CHECKS[0]} checks, {len(FAILURES)} failed")
 for f in FAILURES:
