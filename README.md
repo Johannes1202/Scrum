@@ -30,12 +30,13 @@
 - Rugby news feed
 
 ### As a prediction league
-- 6 prediction types: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer
-- Banker pick — one per round, doubles your points for that match
-- Private groups, each choosing its own competitions and prediction types
-- **Global league is opt-in** — compete server-wide only if you want to; otherwise only your own groups count, toward both leaderboards and your profile
+- 7 scoring rules, **each switchable per group**: Score, Winner, Margin Band, Both Teams Scored, Anytime Try Scorer, First Try Scorer, and the Banker
+- **Banker pick — one per group, per player, per week.** You choose it per group, so the same prediction can be your banker in one league and an ordinary pick in another. Once the match you banked has kicked off the banker is spent for that week and cannot be moved to a later fixture
+- Private groups, each choosing its own competitions and its own scoring rules — shown as chips on the group card, so how a league is played is visible before you open it
+- **Global league is opt-in and carries no modifiers.** Groups are where house rules live; Global is a plain, comparable measure across everyone. Whether a doubling makes sense is a question of format — a league with a full weekend round wants a banker, a group that sees a fixture every few months does not
 - Group leaderboards, accuracy by prediction type, head-to-head, streaks, shareable profile cards
 - Joining a group backfills your already-resolved predictions, so you don't arrive with a blank record
+- **Predict Now** on your profile only offers fixtures your own groups actually cover, rather than everything the server tracks
 
 ### Seasons
 Matches carry a season label — split-year for northern club competitions (`2026-27`), calendar year for everything else — so next season never piles onto this one. Archiving a season moves a group's boundary forward rather than deleting rows, keeping last season inspectable match by match.
@@ -48,6 +49,18 @@ A touring side playing a club side belongs to no league, so a league-indexed loo
 
 - **Manual fixtures** — declare a fixture in config or accept one from the admin panel. If ESPN later publishes it, the real event wins, matched on teams and date.
 - **Discovery check** — asks a secondary source *"what's next for the teams we follow?"* and flags anything Scrum doesn't have, with **Add** and **Dismiss** on the admin page. It's a check, not a data source: it never writes match data, so a stale or wrong source costs you a bad suggestion, not a corrupted leaderboard.
+
+### One-off events
+Not every fixture belongs to a competition. A touring side playing a club side, or two
+nations meeting outside any trophy, belongs to no league at all — and a group built around
+a whole competition is the wrong shape for a game that happens once.
+
+A **custom competition** inside a group holds hand-picked matches and scores them on its
+own table, separate from the group's league standings. A group can follow *no* leagues at
+all and exist purely for these, which makes it a one-off event: add the fixture, invite
+whoever wants in, and it stands alone. Add later fixtures to the same competition — already
+selected matches stay selected even once they have been played — or create a new
+competition per event if you would rather each kept its own table.
 
 ### Self-hosted friendly
 - One `docker compose up --build -d` and it's running
@@ -105,10 +118,16 @@ Result correction re-scores every group automatically.
 ```
 
 Runs inside the app container, no extra dependencies. Covers the scoring engine
-(every prediction type, banker doubling, two-pass idempotency, type-coercion
-regressions), derived-league filters, season labelling, Global opt-in and
-per-match deduplication, backfill-on-join, login throttling and session tokens,
-plus a live check against the real ESPN feed.
+(every prediction type, per-group banker rules and the one-per-group-per-week limit,
+two-pass idempotency, type-coercion regressions), custom-competition scoring,
+derived-league filters, season labelling, Global opt-in and per-match deduplication,
+backfill-on-join, login throttling and session tokens, plus a live check against the
+real ESPN feed.
+
+Each suite runs under a timeout, so a hang is reported as a failure rather than
+silently truncating the run — a suite that leaked a database connection once blocked
+the loop and stopped two of the four files from running at all, while everything it
+printed still said `0 failed`.
 
 ---
 
