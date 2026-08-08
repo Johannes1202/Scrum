@@ -4791,6 +4791,13 @@ table{{width:100%;border-collapse:collapse}}td{{padding:.5rem .3rem;border-botto
   <div class="page-title">Settings — {_esc(g['name'])}</div>
   <form method="post" action="/groups/{_esc(slug)}/settings">
     <div class="form-section">
+      <div class="section-label">Name &amp; Description</div>
+      <input type="text" name="name" value="{_esc(g['name'])}" maxlength="60" required
+             style="width:100%;margin-bottom:.5rem" aria-label="Group name">
+      <textarea name="description" rows="2" maxlength="300" placeholder="What is this group for?"
+                style="width:100%;font-family:inherit;font-size:.9rem" aria-label="Group description">{_esc(g['description'] or '')}</textarea>
+    </div>
+    <div class="form-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.9rem">
         <div class="section-label" style="margin-bottom:0">Competitions</div>
         <a href="/groups/{_esc(slug)}/competitions" class="btn btn-sm btn-ghost" style="font-size:.72rem">
@@ -4832,6 +4839,15 @@ async def group_settings_post(request: Request, slug: str):
     form = await request.form()
     leagues = form.getlist("leagues")
     pred_types = form.getlist("pred_types")
+
+    # Blank name means the field was not submitted (an older cached form) — keep the
+    # existing one rather than blanking the group.
+    new_name = (form.get("name") or "").strip()[:60]
+    if new_name:
+        await _db.execute("UPDATE groups SET name=? WHERE id=?", (new_name, g["id"]))
+    if form.get("description") is not None:
+        desc = (form.get("description") or "").strip()[:300]
+        await _db.execute("UPDATE groups SET description=? WHERE id=?", (desc or None, g["id"]))
 
     await _db.execute("DELETE FROM group_leagues WHERE group_id=?", (g["id"],))
     await _db.execute("DELETE FROM group_prediction_types WHERE group_id=?", (g["id"],))
@@ -5418,13 +5434,14 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
     is_admin = user and user["is_admin"]
 
     async with _db.execute(
-        "SELECT match_title, team_home, team_away, kickoff_ts FROM predictions WHERE match_id=? LIMIT 1",
+        "SELECT match_title, team_home, team_away, kickoff_ts, tournament FROM predictions WHERE match_id=? LIMIT 1",
         (slug,),
     ) as cur:
         row = await cur.fetchone()
     if row:
         d = dict(row)
         title, team_home, team_away, kickoff_ts = d["match_title"], d["team_home"], d["team_away"], d["kickoff_ts"]
+        tournament = tournament or (d.get("tournament") or "")
     elif th and ta:
         team_home, team_away = th.strip(), ta.strip()
         title = title.strip() or f"{team_home} vs {team_away}"
@@ -5434,6 +5451,24 @@ async def predict_page(request: Request, slug: str, th: str = "", ta: str = "", 
 <style>{_BASE_CSS}</style></head><body>{_nav(username, is_admin)}
 <div style="padding:3rem 2rem;text-align:center;color:var(--muted)">Match not found or no predictions yet.</div>
 </body></html>""")
+
+    # Still blank? Try the stored result, then the fixture feed. Only if all three miss
+    # do we fall back to the union over every group, which is the old behaviour.
+    if not tournament:
+        async with _db.execute(
+            "SELECT tournament FROM match_results WHERE match_id=? LIMIT 1", (slug,)
+        ) as cur:
+            mr = await cur.fetchone()
+        if mr:
+            tournament = dict(mr)["tournament"] or ""
+    if not tournament:
+        try:
+            for m in await _fetch_espn_upcoming():
+                if m.get("slug") == slug:
+                    tournament = m.get("tournament") or ""
+                    break
+        except Exception:
+            pass
 
     now = time.time()
     window_open = (kickoff_ts == 0) or (kickoff_ts - 172800 <= now < kickoff_ts)
