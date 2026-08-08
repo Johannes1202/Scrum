@@ -802,7 +802,19 @@ async def _score_group(group_id: int, match_id: str, tournament: str,
     ) as cur:
         group_leagues = {r["league_slug"] for r in await cur.fetchall()}
     if tournament not in group_leagues:
-        return
+        # A group can also carry hand-picked matches in a custom competition, and those
+        # belong to it whatever leagues it follows - a one-off event group follows none
+        # at all. Without this the competition's fixtures render, its Predict button
+        # works, predictions save (they are global), and its standings table stays on
+        # zero for ever. Nothing errors, which is why the feature had never been used.
+        async with _db.execute(
+            """SELECT 1 FROM custom_competition_matches ccm
+               JOIN custom_competitions cc ON cc.id = ccm.comp_id
+               WHERE cc.group_id=? AND ccm.match_id=? LIMIT 1""",
+            (group_id, match_id),
+        ) as cur:
+            if not await cur.fetchone():
+                return
 
     async with _db.execute(
         "SELECT prediction_type FROM group_prediction_types WHERE group_id=?", (group_id,)

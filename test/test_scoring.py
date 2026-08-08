@@ -442,6 +442,33 @@ async def main():
     check("a Nations Championship match is above it", ts_("2026-07-11") > floor, True)
     check("the tour is above it", ts_("2026-08-07") > floor, True)
 
+    # ── Custom competitions ───────────────────────────────────────────────────
+    # A one-off event group follows no leagues at all; its fixtures come from a custom
+    # competition. Scoring used to gate purely on group_leagues, so such a group could
+    # never score: fixtures rendered, predictions saved, standings stayed empty.
+    await setup_group(60, ["cc1", "cc2"], leagues=())
+    await server._db.execute(
+        "INSERT OR REPLACE INTO custom_competitions (id,group_id,name,slug,created_at) "
+        "VALUES(?,?,?,?,?)", (60, 60, "One-off", "one-off", time.time()))
+    await server._db.execute(
+        "INSERT OR REPLACE INTO custom_competition_matches "
+        "(comp_id,match_id,espn_id,league_id,team_home,team_away,kickoff_ts,tournament) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (60, "CC-1", "CC-1", 289234, "Argentina", "South Africa", KICKOFF, "international"))
+    await server._db.commit()
+
+    await predict("CC-1", "cc1", 20, 20, winner="draw", tournament="international")
+    await server._score_group(60, "CC-1", "international", 20, 20, "draw", "1-7", 1)
+    got = await points(60, "CC-1", "cc1")
+    check("a league-less group scores its custom-competition match", bool(got), True)
+    check("and awards the winner points", (got or {}).get("pts_winner"), 2)
+
+    # A match nobody picked into the competition must still be ignored by that group.
+    await predict("CC-2", "cc1", 20, 20, winner="draw", tournament="international")
+    await server._score_group(60, "CC-2", "international", 20, 20, "draw", "1-7", 1)
+    check("a match outside both leagues and the competition is not scored",
+          await points(60, "CC-2", "cc1"), None)
+
     # ── Banker week bucketing ─────────────────────────────────────────────────
     wk = server._banker_week_start
     check("same round shares a bucket", wk(KICKOFF), wk(KICKOFF + 3600 * 24))
