@@ -490,6 +490,20 @@ async def main():
     check("a restart does not re-arm banker on a group that switched it off",
           rearmed, None)
 
+    # Global has its own startup loop that re-asserts its defaults every boot, keyed on
+    # group_id 1. Banker must not be in it, or Global is re-armed on every deploy no
+    # matter what the admin set — which is exactly what happened twice.
+    await server._db.execute(
+        "DELETE FROM group_prediction_types WHERE group_id=1 AND prediction_type='banker'")
+    await server._db.commit()
+    await server._db.close()
+    await server._init_db()
+    async with server._db.execute(
+        "SELECT 1 FROM group_prediction_types WHERE group_id=1 AND prediction_type='banker'"
+    ) as cur:
+        global_rearmed = await cur.fetchone()
+    check("a restart does not re-arm banker on Global either", global_rearmed, None)
+
     # ── Banker is a per-group rule ────────────────────────────────────────────
     # Same prediction, same banker flag, two groups: one honours it, one does not.
     # Banker used to be applied unconditionally, so a group with a single fixture a

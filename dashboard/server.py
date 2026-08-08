@@ -646,7 +646,11 @@ async def _init_db():
         except Exception:
             pass
     # Global group: enable all prediction types by default
-    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts", "banker"):
+    # Global's default rules, re-asserted on every startup. Banker is deliberately NOT
+    # here: Global is the objective server-wide measure and carries no modifiers, and
+    # anything in this loop is re-armed on every boot regardless of admin intent —
+    # adding banker here silently switched it back on for Global after each deploy.
+    for pt in ("score", "winner", "margin", "try_anytime", "try_first", "btts"):
         try:
             await _db.execute(
                 "INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type) VALUES(1,?)", (pt,)
