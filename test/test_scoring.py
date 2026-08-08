@@ -470,6 +470,26 @@ async def main():
     check("a match outside both leagues and the competition is not scored",
           await points(60, "CC-2", "cc1"), None)
 
+    # ── The banker backfill runs once, not on every boot ──────────────────────
+    # It was written as a plain INSERT OR IGNORE at startup, so every restart re-armed
+    # the banker for every group and silently undid deliberate opt-outs.
+    await setup_group(90, ["mig"], types=NO_BANKER)
+    await server._db.execute(
+        "DELETE FROM group_prediction_types WHERE group_id=90 AND prediction_type='banker'")
+    await server._db.commit()
+    # Close first: _init_db opens a fresh aiosqlite connection, and leaving the old one
+    # dangling leaks its non-daemon thread and hangs the interpreter at exit — the very
+    # fault the per-suite timeout in all.sh was added to catch, which is how this was
+    # caught within a minute of writing it.
+    await server._db.close()
+    await server._init_db()          # simulate a restart
+    async with server._db.execute(
+        "SELECT 1 FROM group_prediction_types WHERE group_id=90 AND prediction_type='banker'"
+    ) as cur:
+        rearmed = await cur.fetchone()
+    check("a restart does not re-arm banker on a group that switched it off",
+          rearmed, None)
+
     # ── Banker is a per-group rule ────────────────────────────────────────────
     # Same prediction, same banker flag, two groups: one honours it, one does not.
     # Banker used to be applied unconditionally, so a group with a single fixture a

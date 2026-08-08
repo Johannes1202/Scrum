@@ -653,17 +653,29 @@ async def _init_db():
             )
         except Exception:
             pass
-    # Banker used to be unconditional, so no group has a row for it. Scoring now gates on
-    # that row, and without this backfill every existing group would silently lose its
-    # banker the moment this ships. Groups that should not have it are switched off
-    # deliberately afterwards, in the admin UI.
-    try:
+    # Banker used to be unconditional, so no group had a row for it. Scoring now gates on
+    # that row, and without a backfill every existing group would silently lose its banker
+    # the moment this shipped. Groups that should not have it are switched off afterwards.
+    #
+    # ONE TIME ONLY. Written first as a plain INSERT OR IGNORE that ran on every startup,
+    # which re-armed the banker for every group on each restart and silently undid those
+    # opt-outs — a deploy quietly put the banker back into two groups that had been
+    # switched off an hour earlier. A backfill is a migration, not an invariant: it must
+    # record that it has run.
+    await _db.execute(
+        "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    async with _db.execute("SELECT value FROM app_meta WHERE key='banker_backfill'") as cur:
+        already = await cur.fetchone()
+    if not already:
         await _db.execute(
             """INSERT OR IGNORE INTO group_prediction_types (group_id,prediction_type)
                SELECT id, 'banker' FROM groups"""
         )
-    except Exception:
-        pass
+        await _db.execute(
+            "INSERT OR REPLACE INTO app_meta (key,value) VALUES('banker_backfill','done')"
+        )
+        logger.info("Banker backfilled for existing groups (one-time migration)")
     await _db.commit()
 
     logger.info("Admin credentials synced: %s", admin)
